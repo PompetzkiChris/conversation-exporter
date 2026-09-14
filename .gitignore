@@ -1,0 +1,31 @@
+# Allowlist: only source is published. Exports, raw page captures, fixtures built from real
+# conversations, test outputs, notes and binaries stay on the machine that made them.
+/*
+!/.gitignore
+!/.gitattributes
+!/LICENSE
+!/README.md
+!/racket/
+!/fortran/
+!/shared/
+!/assets/
+
+/racket/*
+!/racket/*.rkt
+!/racket/build.cmd
+!/racket/build-gui.cmd
+
+/fortran/*
+!/fortran/src/
+!/fortran/js-src/
+!/fortran/build.ps1
+
+/shared/*
+!/shared/extract.js
+!/shared/embed.py
+!/shared/reference_verify.py
+
+/assets/*
+!/assets/icons/
+/assets/icons/*.png
+/assets/icons/*.ps1

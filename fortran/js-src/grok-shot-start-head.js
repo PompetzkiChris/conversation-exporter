@@ -1,0 +1,1 @@
+(() => { window.__grokRun = { done: false, ok: false, result: null, error: null }; window.__grokShotReady = null; window.__grokShotDone = 0; try { (

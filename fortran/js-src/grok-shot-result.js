@@ -1,0 +1,1 @@
+(() => { const r = window.__grokRun; window.__grokRun = null; return (r && r.result) || null; })()

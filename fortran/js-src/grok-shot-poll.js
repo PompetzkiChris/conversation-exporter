@@ -1,0 +1,1 @@
+(() => { const r = window.__grokRun || {}; const s = window.__grokShotReady; return { done: !!r.done, error: r.error || null, article: s ? s.article : -1, panel: s ? String(s.panel) : '', seq: s ? s.seq : 0 }; })()

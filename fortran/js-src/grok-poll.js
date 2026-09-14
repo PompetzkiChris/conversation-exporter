@@ -1,0 +1,1 @@
+(() => { const arts = document.querySelectorAll('[role=article]').length; const body = document.body ? document.body.innerText : ''; const p = location.pathname; return { href: location.href, n: arts, main: !!document.querySelector('main'), signin: /\/(sign-in|login)/i.test(p) || (arts === 0 && /\bSign in\b/.test(body)) }; })()
