@@ -97,7 +97,9 @@ async (opts) => {
     for (const e of document.querySelectorAll('.qwen-chat-message-assistant')) {
       const box = e.querySelector('[id^="chat-response-message-"]') || e;
       const id = (box.id || '').replace('chat-response-message-', '');
-      const text = norm((e.querySelector('.response-message-content') || e).textContent);
+      // a reply can render several answer blocks (a leaked </think>, then a web search card, then the answer)
+      const parts = [...e.querySelectorAll('.response-message-content')];
+      const text = norm((parts.length ? parts : [e]).map(p => p.textContent).join(' '));
       if (!assistants.has(id) || text.length > assistants.get(id).length) assistants.set(id, text);
     }
   };

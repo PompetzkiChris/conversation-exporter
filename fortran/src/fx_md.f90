@@ -478,6 +478,15 @@ contains
        call head(one_line_s(arg_str(a, 'description')))
        cmd = arg_str(a, 'command')
        if (len(cmd) > 0) call emit_fenced(o, 'bash', cmd)
+       ! command output (WebSocket history, see fx_grok grok_merge_ws_results)
+       if (jequal_str(jget(res, 'kind'), 'code') .and. jis_str(jget(res, 'stdout'))) then
+          if (jis_int(jget(res, 'exitCode'))) then
+             call ln(o, '  Output (exit code '//i64toa(jint(jget(res, 'exitCode')))//'):')
+          else
+             call ln(o, '  Output:')
+          end if
+          call emit_fenced(o, 'text', jstr(jget(res, 'stdout')))
+       end if
     case ('editFile')
        fp = arg_str(a, 'filePath', 'file_path')
        olds = arg_str(a, 'oldString', 'old_string')
@@ -540,8 +549,8 @@ contains
     integer, intent(in) :: t
     character(len=:), allocatable :: md
     type(strbuf) :: o
-    integer :: c, turn, atts, a, th, rl, ev, args, res, items, cits, ci, n, s, webs, xs, w, p, qv, tr
-    character(len=:), allocatable :: k, label, msg, q, ty
+    integer :: c, turn, atts, a, th, rl, ev, args, res, items, cits, ci, n, s, webs, xs, w, p, qv, tr, ipass, im, kimg
+    character(len=:), allocatable :: k, label, msg, q, ty, tl
     c = jget(t, 'conversation')
     if (truthy(jget(c, 'title'))) then
        call ln(o, '# '//py_str(jget(c, 'title')))
@@ -556,10 +565,24 @@ contains
     call ln(o, '- Created: '//py_str(jget(c, 'createTime')))
     call ln(o, '- Modified: '//py_str(jget(c, 'modifyTime')))
     call ln(o, '')
-    turn = jfirst(list_or0(jget(t, 'turns')))
+    ! offBranchTurns (edited messages, regenerated replies) follow the current branch under their own heading
+    do ipass = 1, 2
+    if (ipass == 1) then
+       turn = jfirst(list_or0(jget(t, 'turns'))); tl = 'turn'
+    else
+       turn = jfirst(list_or0(jget(t, 'offBranchTurns'))); tl = 'other version'
+       if (turn > 0) then
+          call ln(o, '## Other versions')
+          call ln(o, '')
+          call ln(o, 'Edited messages and regenerated replies that are not on the current branch of the conversation '// &
+                     '(the branch the page shows). transcript.json keeps them under offBranchTurns with their responseId '// &
+                     'and parentResponseId.')
+          call ln(o, '')
+       end if
+    end if
     do while (turn > 0)
        if (jequal_str(jget(turn, 'sender'), 'human')) then
-          call ln(o, '## User  (turn '//py_str(jget(turn, 'index'))//', '//py_str(jget(turn, 'createTime'))//')')
+          call ln(o, '## User  ('//tl//' '//py_str(jget(turn, 'index'))//', '//py_str(jget(turn, 'createTime'))//')')
           call ln(o, '')
           call emit_image_surfaces(o, turn)
           atts = list_or0(jget(turn, 'attachments'))
@@ -574,7 +597,7 @@ contains
           call ln(o, '')
        else
           th = hash_or0(jget(turn, 'thinking'))
-          call ln(o, '## Grok  (turn '//py_str(jget(turn, 'index'))//', '//py_str(jget(turn, 'createTime'))//', model '// &
+          call ln(o, '## Grok  ('//tl//' '//py_str(jget(turn, 'index'))//', '//py_str(jget(turn, 'createTime'))//', model '// &
                      py_str(jget(turn, 'model'))//')')
           call ln(o, '')
           call emit_image_surfaces(o, turn)
@@ -661,6 +684,18 @@ contains
              end do
              call ln(o, '')
           end if
+          if (jlen(list_or0(jget(turn, 'images'))) > 0) then
+             call ln(o, 'Images:')
+             call ln(o, '')
+             im = jfirst(list_or0(jget(turn, 'images'))); kimg = 0
+             do while (im > 0)
+                kimg = kimg + 1
+                call ln(o, '- ['//itoa(kimg)//'] '//one_line_s(py_str(jget(im, 'title')))//' ('//py_str(jget(im, 'source'))// &
+                           ') '//py_str(jget(im, 'url'))//'  page '//py_str(jget(im, 'link'))//'  (offset '//py_str(jget(im, 'offset'))//')')
+                im = jnext(im)
+             end do
+             call ln(o, '')
+          end if
           s = hash_or0(jget(turn, 'sources'))
           webs = list_or0(jget(s, 'webSearchResults')); xs = list_or0(jget(s, 'xposts'))
           tr = 0
@@ -680,6 +715,7 @@ contains
           call ln(o, '')
        end if
        turn = jnext(turn)
+    end do
     end do
     md = sb_str(o)
   end function transcript_markdown

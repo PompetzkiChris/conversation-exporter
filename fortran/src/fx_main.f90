@@ -67,7 +67,9 @@ program exporter_f
   type(cdp) :: c2
   logical :: have_c2 = .false.
   character(len=:), allocatable :: tab2_id, export_dir, api_lane
-  character(len=:), allocatable :: js_poll, js_b64, js_chips, js_head, js_tail, js_spoll, js_sres, js_extract
+  character(len=:), allocatable :: js_poll, js_b64, js_chips, js_head, js_tail, js_spoll, js_sres, js_extract, js_wshook, js_wsread
+  integer :: ws_frames = 0          ! JSON array of the page's WebSocket history frames (0 = none)
+  character(len=:), allocatable :: api_post_ids   ! ' id id ... ': X posts the transcript carries with an author
   type(text_item), allocatable :: gwarn(:)
   type(pending_file), allocatable :: pend(:)
   integer :: ngw = 0, npend = 0, nrounds = 0, chip_links1 = 0
@@ -481,6 +483,7 @@ contains
     js_poll = js_file('grok-poll.js'); js_b64 = js_file('grok-fetch-b64.js'); js_chips = js_file('grok-chip-links.js')
     js_head = js_file('grok-shot-start-head.js'); js_tail = js_file('grok-shot-start-tail.js')
     js_spoll = js_file('grok-shot-poll.js'); js_sres = js_file('grok-shot-result.js'); js_extract = js_file('extract.js')
+    js_wshook = js_file('grok-ws-hook.js'); js_wsread = js_file('grok-ws-read.js'); ws_frames = 0; api_post_ids = ''
     u = grok_normalize(trim(url))
     if (len(u) == 0) then
        call log_line('ERROR: not a URL or conversation id: '//trim(url)); return
@@ -497,11 +500,13 @@ contains
        call log_line('ERROR: WebSocket connection to the tab failed'); call finish(); return
     end if
     call prepare_tab(c)
+    r = cdp_call(c, 'Page.addScriptToEvaluateOnNewDocument', '{"source":'//jquote(js_wshook)//'}')
     call log_line('Navigating to '//u)
     call navigate(c, u)
     if (.not. wait_conversation(c, final_url)) then
        call finish(); return
     end if
+    call capture_ws_history()
     call grok_classify(final_url, kind, gid)
     ! API lane
     data = 0; chunk = 0; legacy = 0; conv = 0; tchunk = 0; tlegacy = 0; api_lane = 'unavailable'
@@ -545,7 +550,9 @@ contains
        else
           call grok_transcript(data, conv, gid, final_url, text)
        end if
+       call merge_ws(text)
        t = jparse(text)
+       api_post_ids = ' '; call collect_post_ids(t)
        parsed_fmt = grok_format(data)
        call record_sandbox(data, t)
        call emit(dir, 'transcript.json', text)
@@ -593,9 +600,10 @@ contains
              else
                 call grok_transcript(data2, conv2, gid, final_url, text)
              end if
+             call merge_ws(text)
              call note_add('API retry pass '//itoa(pass)//' returned a hydrated payload; the transcript is rebuilt from raw/api-*'// &
                            suffix//'.json (the first-pass payload is kept as raw/api-*.json)')
-             data = data2; t = jparse(text); parsed_fmt = grok_format(data); call record_sandbox(data, t)
+             data = data2; t = jparse(text); api_post_ids = ' '; call collect_post_ids(t); parsed_fmt = grok_format(data); call record_sandbox(data, t)
              call emit(dir, 'transcript.json', text)
              exit
           else if (pass < 3) then
@@ -1078,7 +1086,9 @@ contains
                       if (jis_str(jget(res, 'url'))) then
                          s = jstr(jget(res, 'url'))
                          if (starts_with(s, 'https://x.com//status/') .or. starts_with(s, 'http://x.com//status/') .or. &
-                             starts_with(s, 'https://www.x.com//status/') .or. starts_with(s, 'http://www.x.com//status/')) n = n + 1
+                             starts_with(s, 'https://www.x.com//status/') .or. starts_with(s, 'http://www.x.com//status/')) then
+                            if (post_known(s)) n = n + 1
+                         end if
                       end if
                       res = jnext(res)
                    end do
@@ -1094,6 +1104,47 @@ contains
                         'the page was rendered from the unhydrated payload'
   end function capture_unhydrated
 
+  ! An empty-handle post counts only if the transcript carries it with an author (when it carries any): a post
+  ! outside that set is one the API also serves without an author (deleted or unavailable), and the page renders
+  ! it with an empty handle however often it is reloaded.
+  logical function post_known(url)
+    character(len=*), intent(in) :: url
+    integer :: i, j
+    post_known = .true.
+    if (.not. allocated(api_post_ids)) return
+    if (len_trim(api_post_ids) == 0) return
+    i = index(url, '/status/')
+    if (i == 0) then
+       post_known = .false.; return
+    end if
+    i = i + 8; j = i
+    do while (j <= len(url))
+       if (url(j:j) < '0' .or. url(j:j) > '9') exit
+       j = j + 1
+    end do
+    post_known = (j > i) .and. index(api_post_ids, ' '//url(i:j-1)//' ') > 0
+  end function post_known
+
+  ! every object with a string postId and a non-empty string username -> ' id ' appended to api_post_ids
+  recursive subroutine collect_post_ids(p)
+    integer, intent(in) :: p
+    integer :: q
+    if (jis_obj(p)) then
+       if (jis_str(jget(p, 'postId')) .and. jis_str(jget(p, 'username'))) then
+          if (len(jstr(jget(p, 'username'))) > 0) then
+             if (index(api_post_ids, ' '//jstr(jget(p, 'postId'))//' ') == 0) &
+                api_post_ids = api_post_ids//jstr(jget(p, 'postId'))//' '
+          end if
+       end if
+    end if
+    if (jis_obj(p) .or. jis_arr(p)) then
+       q = jfirst(p)
+       do while (q > 0)
+          call collect_post_ids(q)
+          q = jnext(q)
+       end do
+    end if
+  end subroutine collect_post_ids
   ! starts extract.js as a background promise on the page
   logical function extractor_start(cc, k, shots)
     type(cdp), intent(inout) :: cc
@@ -1167,7 +1218,7 @@ contains
     logical :: ok, a, b
     integer(int64) :: t0
     t0 = now_ms(); dom_t0 = t0
-    call cdp_new_tab(port, 'about:blank', id2, ws2, ok)
+    call cdp_new_window(port, 'about:blank', id2, ws2, ok)
     if (ok) ok = cdp_connect(c2, ws2, 1000000)
     if (.not. ok) then
        call gwarn_add('second tab for the concurrent DOM round could not be opened; the rounds run one after the other')
@@ -1359,6 +1410,53 @@ contains
     call jcanon_value(w, jparse(sb_str(d)))
     r = jw_result(w)
   end function partial_verification
+
+  ! the page's WebSocket history: command output and other agent tool results that the REST responses lack
+  subroutine capture_ws_history()
+    integer :: v, it, k, fr
+    integer(int64) :: t1
+    character(len=:), allocatable :: err
+    type(strbuf) :: raw, valid
+    t1 = now_ms()
+    do
+       v = cdp_eval(c, js_wsread, .false., err)
+       if (jis_true(jget(v, 'done')) .or. now_ms() - t1 > 20000) exit
+       call sleep_ms(500)
+    end do
+    k = 0; ws_frames = 0
+    call sb_add(valid, '[')
+    call sb_add(raw, '[')
+    it = jfirst(jget(v, 'items'))
+    do while (it > 0)
+       if (jis_str(it)) then
+          if (raw%n > 1) call sb_add(raw, ','//achar(10))
+          call sb_add(raw, jstr(it))
+          fr = 0
+          if (looks_json(jstr(it))) fr = jparse(jstr(it))
+          if (jis_obj(fr)) then
+             if (k > 0) call sb_add(valid, ',')
+             call sb_add(valid, jstr(it)); k = k + 1
+          end if
+       end if
+       it = jnext(it)
+    end do
+    call sb_add(raw, ']'//achar(10)); call sb_add(valid, ']')
+    ! kept verbatim: the frames exactly as the server sent them, as one JSON array
+    if (raw%n > 3) call save_raw('raw/ws-history.json', sb_str(raw))
+    if (k > 0) ws_frames = jparse(sb_str(valid))
+    call log_line('WebSocket history: '//itoa(k)//' item(s), done '//pick(jis_true(jget(v, 'done')), 'true', 'false')// &
+                  ' ('//i64toa(now_ms() - t1)//' ms)')
+  end subroutine capture_ws_history
+
+  subroutine merge_ws(text)
+    character(len=:), allocatable, intent(inout) :: text
+    character(len=:), allocatable :: merged
+    integer :: n
+    if (ws_frames <= 0) return
+    call grok_merge_ws_results(text, ws_frames, merged, n)
+    text = merged
+    if (n > 0) call note_add(itoa(n)//' tool result(s) (command output) filled from the page''s WebSocket history (raw/ws-history.json)')
+  end subroutine merge_ws
 
   ! Page.captureScreenshot -> PNG file under dir; rel uses forward slashes (manifest form)
   logical function screenshot_to(cc, dir, rel, beyond) result(ok)

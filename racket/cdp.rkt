@@ -10,6 +10,7 @@
 
 (provide cdp-new-target
          cdp-close-target
+         cdp-new-window-target
          cdp-list-targets
          cdp-connect
          cdp-close
@@ -27,6 +28,23 @@
 ;; PUT /json/new?<url> -> target jsexpr (id, webSocketDebuggerUrl, ...)
 (define (cdp-new-target host port [url "about:blank"])
   (http-put-json host port (string-append "/json/new?" url)))
+
+;; A page in its own browser window.  A tab behind another tab of the same window is hidden and stops
+;; rendering (no requestAnimationFrame, no IntersectionObserver), so a page that loads older content when
+;; scrolled to the top never loads it there; a separate window keeps rendering (Chrome runs with
+;; --disable-backgrounding-occluded-windows).  -> the /json/list entry of the new page.
+(define (cdp-new-window-target host port [url "about:blank"])
+  (define v (http-get-json host port "/json/version"))
+  (define bc (cdp-connect (hash-ref v 'webSocketDebuggerUrl)))
+  (define id
+    (dynamic-wind void
+                  (lambda () (hash-ref (cdp-call bc "Target.createTarget" (hasheq 'url url 'newWindow #t)) 'targetId))
+                  (lambda () (cdp-close bc))))
+  (let loop ([k 0])
+    (define t (for/first ([x (in-list (cdp-list-targets host port))] #:when (equal? (hash-ref x 'id #f) id)) x))
+    (cond [t t]
+          [(< k 40) (sleep 0.05) (loop (add1 k))]
+          [else (error 'cdp-new-window-target "new target ~a is not listed by /json/list" id)])))
 
 (define (cdp-close-target host port id)
   (define-values (code headers body)

@@ -190,7 +190,7 @@ def check_assistant_text(rep, t, cap):
             if sub:
                 rep.warnings.append("turn %d: the page renders %d of %d reply words; the export keeps the full API text (see assistant-text.missingFromDom)" % (i, len(dw), len(ew)))
 
-GLUE = re.compile(r"([.!?])(?=[A-Z])")   # "team.An": the API glues consecutive reply messages without a space
+GLUE = re.compile(r"([.!?][\"\u201d\u2019)\]]*)(?=[A-Z])")   # "team.An", "boy.”That": the API glues consecutive reply messages without a space
 def split_glue(words):
     return GLUE.sub(r"\1 ", " ".join(words)).split()
 
@@ -236,10 +236,12 @@ def check_attachments(rep, t, cap, att_dir):
         # names live only in a hover tooltip; a null DOM name means the tooltip did not render (hidden tab) and is not an error,
         # a present DOM name must match the API name.  fileIds (from the preview src) and preview URLs are the hard identity.
         names_ok = len(exp["names"]) == len(act["names"]) and all(d is None or d == e for e, d in zip(exp["names"], act["names"]))
-        ok = names_ok and exp["fileIds"] == act["fileIds"] and exp["previewUrls"] == act["previewUrls"] and size_ok
+        # a file without a preview (a PDF) has no element on the page that carries its id
+        visible_ids = [x.get("fileId") if x.get("previewUrl") else None for x in api]
+        ok = names_ok and visible_ids == act["fileIds"] and exp["previewUrls"] == act["previewUrls"] and size_ok
         rep.add("attachments", i, exp, act, ok, sizeCheck=("files" if att_dir else "not performed (no --attachments DIR)"),
                 nameSource=("dom tooltip" if all(d is not None for d in act["names"]) else "api (the page shows the name only in a hover tooltip)"),
-                rule="fileIds and previewUrls equal; DOM names equal when present; sizes equal when files are given")
+                rule="fileIds equal where the API has a preview (the page shows the id only in the preview image URL); previewUrls equal; DOM names equal when present; sizes equal when files are given")
 
 def check_thought_label(rep, t, cap):
     arts = dom_articles(cap)
@@ -252,7 +254,11 @@ def check_thought_label(rep, t, cap):
         dur = th.get("durationMs")
         delta = None if (secs is None or dur is None) else abs(secs * 1000 - dur)
         ok = delta is not None and delta <= 2000
-        rep.add("thought-label", i, {"durationMs": dur, "toleranceMs": 2000}, {"label": label, "seconds": secs, "deltaMs": delta}, ok)
+        extra = {}
+        # the page shows no Thoughts label for a reply whose thinking produced no events
+        if not label and not any(rl.get("events") for rl in th.get("rollouts") or []):
+            ok = True; extra["note"] = "no thinking events in the API and no Thoughts label on the page"
+        rep.add("thought-label", i, {"durationMs": dur, "toleranceMs": 2000}, {"label": label, "seconds": secs, "deltaMs": delta}, ok, **extra)
 
 def check_rollouts(rep, t, cap):
     for turn in t["turns"]:
@@ -331,6 +337,7 @@ def check_tool_rows(rep, t, cap):
             res = ev.get("results") or {}
             items = res.get("items") or []
             key = urlkey(args.get("url")) if ev["kind"] == "browsePage" else norm(args.get("query"))
+            if ev["kind"] == "browsePage" and key.startswith("grok.com/"): continue   # grok.com's own pages are not listed as sources
             exp_rows.append({"rollout": rl["id"], "kind": DOM_KIND[ev["kind"]], "apiKind": ev["kind"], "key": key,
                              "count": len(items) if ev["kind"] == "webSearch" else None,
                              "urls": [x.get("url") for x in items] if ev["kind"] == "webSearch" else None})
@@ -365,6 +372,10 @@ def check_tool_rows(rep, t, cap):
                 {"rows": len(act_rows), "webSearchRows": sum(1 for r in act_rows if r["kind"] == "Searched web"), "webResultUrls": sum(len(r["urls"]) for r in act_rows if r["kind"] == "Searched web"), "domRowsTotal": (pan or {}).get("rowCount")},
                 ok, missingInDom=[{"rollout": m[0], "kind": m[1], "key": m[2]} for m in missing], extraInDom=[{"rollout": m[0], "kind": m[1], "key": m[2]} for m in extra], urlMismatches=url_mismatch)
 
+REFERRER = re.compile(r"[?&]referrer=grok-com$")   # grok.com appends this to X post links it renders
+def href_key(h):
+    return REFERRER.sub("", h) if isinstance(h, str) else h
+
 def chip_size(chip):
     m = re.search(r"\+(\d+)\s*$", norm(chip.get("text")))
     return 1 + (int(m.group(1)) if m else 0)
@@ -388,8 +399,8 @@ def check_citations(rep, t, cap):
         act = {"chips": len(chips), "effectiveChips": eff, "chipTexts": [norm(c.get("text")) for c in chips], "chipHrefs": [c.get("href") for c in chips]}
         if have_urls:
             count_ok = eff == len(distinct) or eff == len(cits)
-            bad_href = [h for h in hrefs if h not in api_urls]
-            unverifiable = [u for u in distinct if u not in hrefs]
+            bad_href = [h for h in hrefs if href_key(h) not in api_urls]
+            unverifiable = [u for u in distinct if u not in [href_key(h) for h in hrefs]]
             # an unmatched API URL is acceptable only when some chip is an href-less group chip (X posts)
             groups_without_href = [c for c in chips if not c.get("href")]
             ok = count_ok and not bad_href and (not unverifiable or bool(groups_without_href))
@@ -404,6 +415,19 @@ def check_citations(rep, t, cap):
                     enrichment={"mode": mode, "chipHrefs": [c.get("href") for c in chips], "chipTexts": [norm(c.get("text")) for c in chips]})
             if mode == "ambiguous":
                 rep.warnings.append("turn %d: %d citation(s) but %d chip(s); citation URLs cannot be assigned from the DOM, left null" % (i, len(cits), eff))
+
+def check_images(rep, t, cap):
+    """Searched images: the page's image figures link to the same pages as the API's image cards, in order."""
+    arts = dom_articles(cap)
+    for turn in t["turns"]:
+        if turn["sender"] != "assistant": continue
+        i = turn["index"]
+        api = turn.get("images") or []
+        dom = (arts[i] if i < len(arts) else {}).get("images") or []
+        if not api and not dom: continue
+        exp = {"count": len(api), "links": [x.get("link") for x in api]}
+        act = {"count": len(dom), "links": [d.get("link") for d in dom], "srcs": [d.get("src") for d in dom]}
+        rep.add("images", i, exp, act, exp["links"] == act["links"], rule="page image links equal the API image cards' links, in order")
 
 def check_expansion(rep, t, cap):
     for key, name in (("thoughtsByArticle", "thoughts"), ("sourcesByArticle", "sources")):
@@ -433,7 +457,9 @@ def strip_env(cap):
     """Drop volatile fields before comparing two rounds: capturedAt, env, and articles[*].html
     (the rendered markdown HTML carries per-render attributes; the text/structure fields are what must be stable)."""
     out = {k: v for k, v in cap.items() if k not in ("capturedAt", "env")}
-    out["articles"] = [{k: v for k, v in a.items() if k != "html"} for a in (out.get("articles") or [])]
+    # attachment names come from a hover tooltip that one read may render and the other not (checked against the API)
+    unnamed = lambda v: [{kk: vv for kk, vv in x.items() if kk != "name"} if isinstance(x, dict) else x for x in v] if isinstance(v, list) else v
+    out["articles"] = [{k: (unnamed(v) if k == "attachments" else v) for k, v in a.items() if k != "html"} for a in (out.get("articles") or [])]
     return out
 
 def diff_paths(a, b, path="", out=None, limit=40):
@@ -458,7 +484,7 @@ def stability(p1, p2, out):
     ok = s1 == s2
     rec = {"name": "dom-stability", "turnIndex": None, "expected": {"sha256": sha(s1), "bytes": len(s1.encode("utf-8")), "file": os.path.basename(p1)},
            "actual": {"sha256": sha(s2), "bytes": len(s2.encode("utf-8")), "file": os.path.basename(p2)}, "ok": ok,
-           "ignored": ["capturedAt", "env", "articles[*].html"], "differences": [] if ok else diff_paths(strip_env(c1), strip_env(c2))}
+           "ignored": ["capturedAt", "env", "articles[*].html", "articles[*].attachments[*].name"], "differences": [] if ok else diff_paths(strip_env(c1), strip_env(c2))}
     res = {"tool": "reference_verify.py --stability", "checks": [rec], "summary": {"total": 1, "ok": 1 if ok else 0, "failed": 0 if ok else 1}, "ok": ok}
     txt = canonical(res)
     if out:
@@ -482,6 +508,7 @@ def verify(transcript_path, capture_path, out_path, att_dir=None):
     check_chatroom(rep, t, cap)
     check_tool_rows(rep, t, cap)
     check_citations(rep, t, cap)
+    check_images(rep, t, cap)
     check_expansion(rep, t, cap)
     check_api_presence(rep, t, cap)
     failed = [c for c in rep.checks if not c["ok"]]

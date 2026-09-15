@@ -164,7 +164,14 @@
      [(equal? k "bash")
       (define cmd (arg-str a 'command))
       (string-append (head (one-line (arg-str a 'description)))
-                     (if (non-empty? cmd) (pre-block cmd) ""))]
+                     (if (non-empty? cmd) (pre-block cmd) "")
+                     ;; command output (WebSocket history, see transcript.rkt merge-ws-tool-results!)
+                     (if (and (equal? (jget res 'kind) "code") (string? (jget res 'stdout)))
+                         (string-append (sub-line (if (exact-integer? (jget res 'exitCode))
+                                                      (format "Output (exit code ~a):" (jget res 'exitCode))
+                                                      "Output:"))
+                                        (pre-block (jget res 'stdout)))
+                         ""))]
      [(equal? k "editFile")
       (define fp (arg-str a 'filePath 'file_path))
       (define olds (arg-str a 'oldString 'old_string))
@@ -266,12 +273,20 @@
      " · Modified " (esc (jget c 'modifyTime))
      (let ([p (jget c 'isPublic)]) (if (eq? p 'null) "" (format " · Public ~a" (py-str p))))
      "</div>\n")
-  (for ([turn (in-list (or-empty-list (jget t 'turns)))])
-    (define idx (jget turn 'index))
+  ;; offBranchTurns (edited messages, regenerated replies) follow the current branch under their own heading
+  (define main-turns (or-empty-list (jget t 'turns)))
+  (define n-main (length main-turns))
+  (for ([turn (in-list (append main-turns (or-empty-list (jget t 'offBranchTurns))))] [pos (in-naturals)])
+    (define other? (>= pos n-main))
+    (define idx (if other? (format "o~a" (py-str (jget turn 'index))) (jget turn 'index)))
+    (define tl (if other? (format "other version ~a" (py-str (jget turn 'index))) (format "turn ~a" idx)))
+    (when (= pos n-main)
+      (W "<h2 class=\"other-versions\">Other versions</h2>\n"
+         "<div class=\"meta\">Edited messages and regenerated replies that are not on the current branch of the conversation (the branch the page shows).</div>\n"))
     (cond
       [(equal? (jget turn 'sender) "human")
        (W (format "<section class=\"turn user\" id=\"turn-~a\">\n" idx))
-       (W (format "<div class=\"turn-head\">User <span class=\"ts\">turn ~a · ~a</span></div>\n" idx (esc (jget turn 'createTime))))
+       (W (format "<div class=\"turn-head\">User <span class=\"ts\">~a · ~a</span></div>\n" tl (esc (jget turn 'createTime))))
        (W (image-surfaces-html turn))
        (define atts (or-empty-list (jget turn 'attachments)))
        (when (pair? atts)
@@ -295,8 +310,8 @@
       [else
        (define th (or-empty-hash (jget turn 'thinking)))
        (W (format "<section class=\"turn assistant\" id=\"turn-~a\">\n" idx))
-       (W (format "<div class=\"turn-head\">Grok <span class=\"ts\">turn ~a · ~a · model ~a</span></div>\n"
-                  idx (esc (jget turn 'createTime)) (esc (jget turn 'model))))
+       (W (format "<div class=\"turn-head\">Grok <span class=\"ts\">~a · ~a · model ~a</span></div>\n"
+                  tl (esc (jget turn 'createTime)) (esc (jget turn 'model))))
        (W (image-surfaces-html turn))
        (W (format "<div class=\"section-title\">Thoughts (~a ms)</div>\n" (esc (jget th 'durationMs))))
        (for ([rl (in-list (or-empty-list (jget th 'rollouts)))])
@@ -319,6 +334,13 @@
                       (esc (jget ci 'citationId)) (esc (jget ci 'cardId))
                       (let ([k (jget ci 'kind)]) (if (truthy? k) (format ", ~a" (esc k)) "")))))
          (W "</ol>\n"))
+       (define imgs (or-empty-list (jget turn 'images)))
+       (when (pair? imgs)
+         (W "<div class=\"attachments\">\n")
+         (for ([im imgs])
+           (W (format "<figure><a href=\"~a\"><img src=\"~a\" alt=\"~a\" loading=\"lazy\"></a><figcaption>~a · ~a</figcaption></figure>\n"
+                      (esc (jget im 'link)) (esc (jget im 'url)) (esc (jget im 'title)) (esc (jget im 'title)) (esc (jget im 'source)))))
+         (W "</div>\n"))
        (define s (or-empty-hash (jget turn 'sources)))
        (define webs (or-empty-list (jget s 'webSearchResults)))
        (define xs (or-empty-list (jget s 'xposts)))

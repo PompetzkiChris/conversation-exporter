@@ -35,6 +35,8 @@ module fx_verify
       'whose outputChunk is streamed AFTER the last CHANNEL_ASSISTANT_RESPONSE chunk of the turn are not rendered in the '// &
       'Thoughts panel (test conversation turns 7 and 15); the API export keeps them, the page omits them'
 
+  character(len=*), parameter :: RULE_X = '(X post results without an author, which one format lists and the other omits, are left out)'
+
 contains
 
   ! ---------------------------------------------------------------- text
@@ -540,6 +542,20 @@ contains
     r = s(a:b)
   end function strip_ends
 
+  ! key_text of a chip href with grok.com's ?referrer=grok-com (appended to X post links it renders) removed
+  function href_key(p) result(r)
+    integer, intent(in) :: p
+    character(len=:), allocatable :: r, s
+    if (.not. jis_str(p)) then
+       r = key_text(p); return
+    end if
+    s = jstr(p)
+    if (len(s) >= 18) then
+       if (s(len(s)-17:) == '?referrer=grok-com' .or. s(len(s)-17:) == '&referrer=grok-com') s = s(1:len(s)-18)
+    end if
+    r = 's:'//s
+  end function href_key
+
   integer function chip_size(chip)
     integer, intent(in) :: chip
     character(len=:), allocatable :: t
@@ -717,16 +733,47 @@ contains
     glued_subsequence = subsequence(s2, b2)
   end function glued_subsequence
 
+  ! a browse of one of grok.com's own pages (a conversation) is not listed under Sources
+  logical function grok_own_page(kind, url)
+    character(len=*), intent(in) :: kind
+    integer, intent(in) :: url
+    grok_own_page = .false.
+    if (kind == 'browsePage') grok_own_page = starts_with(urlkey(url), 'grok.com/')
+  end function grok_own_page
+
   function glue_split(s) result(r)
     character(len=*), intent(in) :: s
     character(len=:), allocatable :: r
     type(strbuf) :: o
-    integer :: i
-    do i = 1, len(s)
+    integer :: i, j
+    ! a stop, then any closing quotes or brackets (" ” ’ ) ]), then a capital: a space goes after the closers
+    i = 1
+    do while (i <= len(s))
        call sb_add(o, s(i:i))
-       if (i < len(s)) then
-          if (index('.!?', s(i:i)) > 0 .and. s(i+1:i+1) >= 'A' .and. s(i+1:i+1) <= 'Z') call sb_add(o, ' ')
+       if (index('.!?', s(i:i)) > 0) then
+          j = i + 1
+          do
+             if (j <= len(s)) then
+                if (index('")]', s(j:j)) > 0) then
+                   j = j + 1; cycle
+                end if
+             end if
+             if (j + 2 <= len(s)) then
+                if (s(j:j+2) == achar(226)//achar(128)//achar(157) .or. s(j:j+2) == achar(226)//achar(128)//achar(153)) then
+                   j = j + 3; cycle
+                end if
+             end if
+             exit
+          end do
+          if (j <= len(s)) then
+             if (s(j:j) >= 'A' .and. s(j:j) <= 'Z') then
+                if (j > i + 1) call sb_add(o, s(i+1:j-1))
+                call sb_add(o, ' ')
+                i = j; cycle
+             end if
+          end if
        end if
+       i = i + 1
     end do
     r = sb_str(o)
   end function glue_split
@@ -952,7 +999,7 @@ contains
     integer, intent(in) :: t, cap
     character(len=*), intent(in) :: att_dir
     integer :: tu, i, api, dom, x, d, nexp, nact
-    type(strbuf) :: en, ei, ep, es, an, ai, ap, asz
+    type(strbuf) :: en, ei, ep, es, an, ai, ap, asz, ev
     logical :: size_ok, names_ok, all_named, ok
     character(len=:), allocatable :: path, en_s, an_s
     integer(int64) :: sz
@@ -965,18 +1012,25 @@ contains
           dom = list_or0(jget(art_at(list_or0(jget(cap, 'articles')), i), 'attachments'))
           if (jlen(api) > 0 .or. jlen(dom) > 0) then
              call sb_clear(en); call sb_clear(ei); call sb_clear(ep); call sb_clear(es)
-             call sb_clear(an); call sb_clear(ai); call sb_clear(ap); call sb_clear(asz)
-             call sb_add(en, '['); call sb_add(ei, '['); call sb_add(ep, '['); call sb_add(es, '[')
+             call sb_clear(an); call sb_clear(ai); call sb_clear(ap); call sb_clear(asz); call sb_clear(ev)
+             call sb_add(en, '['); call sb_add(ei, '['); call sb_add(ep, '['); call sb_add(es, '['); call sb_add(ev, '[')
              call sb_add(an, '['); call sb_add(ai, '['); call sb_add(ap, '['); call sb_add(asz, '[')
              size_ok = .true.; nexp = 0
              x = jfirst(api)
              do while (x > 0)
                 if (nexp > 0) then
                    call sb_add(en, ','); call sb_add(ei, ','); call sb_add(ep, ','); call sb_add(es, ','); call sb_add(asz, ',')
+                   call sb_add(ev, ',')
                 end if
                 nexp = nexp + 1
                 call sb_add(en, raw(jget(x, 'fileName'))); call sb_add(ei, raw(jget(x, 'fileId')))
                 call sb_add(ep, raw(jget(x, 'previewUrl'))); call sb_add(es, raw(jget(x, 'sizeBytes')))
+                ! a file without a preview (a PDF) has no element on the page that carries its id
+                if (truthy(jget(x, 'previewUrl'))) then
+                   call sb_add(ev, raw(jget(x, 'fileId')))
+                else
+                   call sb_add(ev, 'null')
+                end if
                 path = att_dir//'\'//itoa(i)//'-'//safe_file_name(py_str(jget(x, 'fileId')))//'-'// &
                        safe_file_name(py_str(jget(x, 'fileName')))
                 if (len(att_dir) == 0) then
@@ -1002,7 +1056,7 @@ contains
                 if (jis_null(jget(d, 'name'))) all_named = .false.
                 d = jnext(d)
              end do
-             call sb_add(en, ']'); call sb_add(ei, ']'); call sb_add(ep, ']'); call sb_add(es, ']')
+             call sb_add(en, ']'); call sb_add(ei, ']'); call sb_add(ep, ']'); call sb_add(es, ']'); call sb_add(ev, ']')
              call sb_add(an, ']'); call sb_add(ai, ']'); call sb_add(ap, ']'); call sb_add(asz, ']')
              names_ok = (nexp == nact)
              if (names_ok) then
@@ -1014,7 +1068,7 @@ contains
                    x = jnext(x); d = jnext(d)
                 end do
              end if
-             ok = names_ok .and. (sb_str(ei) == sb_str(ai)) .and. (sb_str(ep) == sb_str(ap)) .and. size_ok
+             ok = names_ok .and. (sb_str(ev) == sb_str(ai)) .and. (sb_str(ep) == sb_str(ap)) .and. size_ok
              if (all_named) then
                 an_s = 'dom tooltip'
              else
@@ -1027,19 +1081,56 @@ contains
                   ',"sizeCheck":'//q(trim(merge('files                               ', &
                                                 'not performed (no --attachments DIR)', len(att_dir) > 0)))// &
                   ',"nameSource":'//q(an_s)// &
-                  ',"rule":"fileIds and previewUrls equal; DOM names equal when present; sizes equal when files are given"}')
+                  ',"rule":"fileIds equal where the API has a preview (the page shows the id only in the preview image URL); previewUrls equal; DOM names equal when present; sizes equal when files are given"}')
           end if
        end if
        tu = jnext(tu)
     end do
   end subroutine check_attachments
 
+  ! Searched images: the page's image figures link to the same pages as the API's image cards, in order.
+  subroutine check_images(t, cap)
+    integer, intent(in) :: t, cap
+    integer :: tu, i, api, dom, x, n
+    type(strbuf) :: el, al, asr
+    tu = jfirst(list_or0(jget(t, 'turns')))
+    do while (tu > 0)
+       if (is_asst(tu)) then
+          i = tindex(tu)
+          api = list_or0(jget(tu, 'images'))
+          dom = list_or0(jget(art_at(list_or0(jget(cap, 'articles')), i), 'images'))
+          if (jlen(api) > 0 .or. jlen(dom) > 0) then
+             call sb_clear(el); call sb_clear(al); call sb_clear(asr)
+             call sb_add(el, '['); call sb_add(al, '['); call sb_add(asr, '[')
+             x = jfirst(api); n = 0
+             do while (x > 0)
+                if (n > 0) call sb_add(el, ',')
+                call sb_add(el, raw(jget(x, 'link'))); n = n + 1; x = jnext(x)
+             end do
+             x = jfirst(dom); n = 0
+             do while (x > 0)
+                if (n > 0) then
+                   call sb_add(al, ','); call sb_add(asr, ',')
+                end if
+                call sb_add(al, raw(jget(x, 'link'))); call sb_add(asr, raw(jget(x, 'src'))); n = n + 1; x = jnext(x)
+             end do
+             call sb_add(el, ']'); call sb_add(al, ']'); call sb_add(asr, ']')
+             call rep_add('images', i, sb_str(el) == sb_str(al), '{"name":"images","turnIndex":'//itoa(i)// &
+                  ',"expected":{"count":'//itoa(jlen(api))//',"links":'//sb_str(el)//'},"actual":{"count":'//itoa(jlen(dom))// &
+                  ',"links":'//sb_str(al)//',"srcs":'//sb_str(asr)//'},"ok":'//bool(sb_str(el) == sb_str(al))// &
+                  ',"rule":"page image links equal the API image cards'' links, in order"}')
+          end if
+       end if
+       tu = jnext(tu)
+    end do
+  end subroutine check_images
+
   subroutine check_thought_label(t, cap)
     integer, intent(in) :: t, cap
-    integer :: tu, i, label, dur
+    integer :: tu, i, label, dur, rl
     integer(int64) :: secs, delta
-    logical :: ok
-    character(len=:), allocatable :: secs_j, delta_j
+    logical :: ok, no_events
+    character(len=:), allocatable :: secs_j, delta_j, note
     tu = jfirst(list_or0(jget(t, 'turns')))
     do while (tu > 0)
        if (is_asst(tu)) then
@@ -1057,9 +1148,22 @@ contains
           else
              delta = abs(secs*1000 - jint(dur)); delta_j = i64toa(delta); ok = (delta <= 2000)
           end if
+          ! the page shows no Thoughts label for a reply whose thinking produced no events
+          note = ''
+          if (.not. truthy(label)) then
+             no_events = .true.
+             rl = jfirst(list_or0(jget(obj_or0(jget(tu, 'thinking')), 'rollouts')))
+             do while (rl > 0)
+                if (truthy(jget(rl, 'events'))) no_events = .false.
+                rl = jnext(rl)
+             end do
+             if (no_events) then
+                ok = .true.; note = ',"note":"no thinking events in the API and no Thoughts label on the page"'
+             end if
+          end if
           call rep_add('thought-label', i, ok, '{"name":"thought-label","turnIndex":'//itoa(i)// &
                ',"expected":{"durationMs":'//raw(dur)//',"toleranceMs":2000},"actual":{"label":'//raw(label)// &
-               ',"seconds":'//secs_j//',"deltaMs":'//delta_j//'},"ok":'//bool(ok)//'}')
+               ',"seconds":'//secs_j//',"deltaMs":'//delta_j//'},"ok":'//bool(ok)//note//'}')
        end if
        tu = jnext(tu)
     end do
@@ -1383,7 +1487,7 @@ contains
              do while (ev > 0)
                 if (jequal_str(jget(ev, 'type'), 'tool') .and. jis_str(jget(ev, 'kind'))) then
                    kind = jstr(jget(ev, 'kind'))
-                   if (len(dom_kind_s(kind)) > 0) then
+                   if (len(dom_kind_s(kind)) > 0 .and. .not. grok_own_page(kind, jget(obj_or0(jget(ev, 'args')), 'url'))) then
                       args = obj_or0(jget(ev, 'args')); res = obj_or0(jget(ev, 'results'))
                       items = list_or0(jget(res, 'items'))
                       if (kind == 'browsePage') then
@@ -1629,7 +1733,7 @@ contains
              do while (c > 0)
                 eff = eff + chip_size(c)
                 if (truthy(jget(c, 'href'))) then
-                   nh = nh + 1; hrefs(nh)%s = key_text(jget(c, 'href'))
+                   nh = nh + 1; hrefs(nh)%s = href_key(jget(c, 'href'))
                 else
                    ngroups_nohref = ngroups_nohref + 1
                 end if
@@ -1648,7 +1752,7 @@ contains
                    if (truthy(jget(c, 'href'))) then
                       found = .false.
                       do j = 1, nu
-                         if (api_urls(j)%s == key_text(jget(c, 'href'))) found = .true.
+                         if (api_urls(j)%s == href_key(jget(c, 'href'))) found = .true.
                       end do
                       if (.not. found) then
                          if (nbad > 0) call sb_add(bad, ',')
@@ -1798,6 +1902,7 @@ contains
     call check_chatroom(t, cap)
     call check_tool_rows(t, cap)
     call check_citations(t, cap)
+    call check_images(t, cap)
     call check_expansion(cap)
     call check_api_presence(t, cap)
     if (present(extra_checks)) then
@@ -1930,7 +2035,12 @@ contains
                call sort_kids(akk, m)
                call jw_begin_obj(w)
                do j = 1, m
-                  call jw_key(w, jname(akk(j))); call jcanon_value(w, akk(j))
+                  call jw_key(w, jname(akk(j)))
+                  if (jname(akk(j)) == 'attachments' .and. jis_arr(akk(j))) then
+                     call put_unnamed(akk(j))     ! tooltip names: one read may render them and the other not
+                  else
+                     call jcanon_value(w, akk(j))
+                  end if
                end do
                call jw_end_obj(w)
                deallocate(akk)
@@ -1943,6 +2053,36 @@ contains
       call jw_end_arr(w)
       ak(1) = 0
     end subroutine put_articles
+    subroutine put_unnamed(arr)
+      integer, intent(in) :: arr
+      integer :: x, y, mm, jj
+      integer, allocatable :: kk(:)
+      call jw_begin_arr(w)
+      x = jfirst(arr)
+      do while (x > 0)
+         if (jis_obj(x)) then
+            allocate(kk(max(jlen(x),1))); mm = 0
+            y = jfirst(x)
+            do while (y > 0)
+               if (jname(y) /= 'name') then
+                  mm = mm + 1; kk(mm) = y
+               end if
+               y = jnext(y)
+            end do
+            call sort_kids(kk, mm)
+            call jw_begin_obj(w)
+            do jj = 1, mm
+               call jw_key(w, jname(kk(jj))); call jcanon_value(w, kk(jj))
+            end do
+            call jw_end_obj(w)
+            deallocate(kk)
+         else
+            call jcanon_value(w, x)
+         end if
+         x = jnext(x)
+      end do
+      call jw_end_arr(w)
+    end subroutine put_unnamed
   end function strip_env_text
 
   character(len=4) function jkind(p)
@@ -2087,8 +2227,121 @@ contains
     if (.not. ok) call diff_paths(jparse(s1), jparse(s2), 40, diffs, n, .false., np)
     r = '{"name":"dom-stability","turnIndex":null,"expected":{"sha256":'//q(sha256_hex(s1))//',"bytes":'//itoa(len(s1))// &
         ',"file":'//q(name1)//'},"actual":{"sha256":'//q(sha256_hex(s2))//',"bytes":'//itoa(len(s2))//',"file":'//q(name2)// &
-        '},"ok":'//bool(ok)//',"ignored":["capturedAt","env","articles[*].html"],"differences":['//sb_str(diffs)//']}'
+        '},"ok":'//bool(ok)//',"ignored":["capturedAt","env","articles[*].html","articles[*].attachments[*].name"],"differences":['//sb_str(diffs)//']}'
   end function stability_record
+
+  ! A post the API lists by id but never hydrates (deleted, unavailable) comes back as an X result with no username
+  ! in the chunk format and not at all in the legacy one.  -> handle of a copy of t without those items, each turn's
+  ! sources.toolResultRows lowered by the number dropped.
+  integer function drop_authorless_x(t) result(t2)
+    integer, intent(in) :: t
+    type(jw) :: w
+    call dx_write(w, t, 0, 0)
+    t2 = jparse(jw_result(w))
+  end function drop_authorless_x
+
+  ! levels: 0 transcript, 1 turn, 2 thinking, 3 rollout, 4 event, 10 sources (rows - removed), 11 x results
+  recursive subroutine dx_write(w, p, level, removed)
+    type(jw), intent(inout) :: w
+    integer, intent(in) :: p, level, removed
+    integer, allocatable :: kids(:)
+    integer :: n, i, j, tk, c, nrem, e
+    character(len=:), allocatable :: k
+    if (.not. jis_obj(p)) then
+       call jcanon_value(w, p); return
+    end if
+    n = jlen(p); allocate(kids(max(n,1)))
+    c = jfirst(p); i = 0
+    do while (c > 0)
+       i = i + 1; kids(i) = c; c = jnext(c)
+    end do
+    do i = 2, n
+       tk = kids(i); j = i - 1
+       do while (j >= 1)
+          if (.not. lgt(jname(kids(j)), jname(tk))) exit
+          kids(j+1) = kids(j); j = j - 1
+       end do
+       kids(j+1) = tk
+    end do
+    nrem = 0
+    if (level == 1) nrem = authorless_in_turn(p)
+    call jw_begin_obj(w)
+    do i = 1, n
+       k = jname(kids(i))
+       call jw_key(w, k)
+       if (level == 0 .and. (k == 'turns' .or. k == 'offBranchTurns') .and. jis_arr(kids(i))) then
+          call jw_begin_arr(w)
+          e = jfirst(kids(i))
+          do while (e > 0)
+             call dx_write(w, e, 1, 0); e = jnext(e)
+          end do
+          call jw_end_arr(w)
+       else if (level == 1 .and. k == 'thinking' .and. nrem > 0) then
+          call dx_write(w, kids(i), 2, 0)
+       else if (level == 1 .and. k == 'sources' .and. nrem > 0) then
+          call dx_write(w, kids(i), 10, nrem)
+       else if (level == 2 .and. k == 'rollouts' .and. jis_arr(kids(i))) then
+          call each(kids(i), 3)
+       else if (level == 3 .and. k == 'events' .and. jis_arr(kids(i))) then
+          call each(kids(i), 4)
+       else if (level == 4 .and. k == 'results' .and. jis_obj(kids(i))) then
+          if (jequal_str(jget(kids(i), 'kind'), 'x')) then
+             call dx_write(w, kids(i), 11, 0)
+          else
+             call jcanon_value(w, kids(i))
+          end if
+       else if (level == 10 .and. k == 'toolResultRows' .and. jis_int(kids(i))) then
+          call jw_int(w, jint(kids(i)) - removed)
+       else if (level == 11 .and. k == 'items' .and. jis_arr(kids(i))) then
+          call jw_begin_arr(w)
+          e = jfirst(kids(i))
+          do while (e > 0)
+             if (truthy(jget(e, 'username'))) call jcanon_value(w, e)
+             e = jnext(e)
+          end do
+          call jw_end_arr(w)
+       else
+          call jcanon_value(w, kids(i))
+       end if
+    end do
+    call jw_end_obj(w)
+  contains
+    recursive subroutine each(arr, lv)
+      integer, intent(in) :: arr, lv
+      integer :: x
+      call jw_begin_arr(w)
+      x = jfirst(arr)
+      do while (x > 0)
+         call dx_write(w, x, lv, 0); x = jnext(x)
+      end do
+      call jw_end_arr(w)
+    end subroutine each
+  end subroutine dx_write
+
+  integer function authorless_in_turn(turn) result(n)
+    integer, intent(in) :: turn
+    integer :: rl, ev, res, it
+    n = 0
+    if (.not. jis_obj(jget(turn, 'thinking'))) return
+    rl = jfirst(list_or0(jget(jget(turn, 'thinking'), 'rollouts')))
+    do while (rl > 0)
+       ev = jfirst(list_or0(jget(rl, 'events')))
+       do while (ev > 0)
+          res = jget(ev, 'results')
+          if (jis_obj(res)) then
+             if (jequal_str(jget(res, 'kind'), 'x')) then
+                it = jfirst(list_or0(jget(res, 'items')))
+                do while (it > 0)
+                   if (.not. truthy(jget(it, 'username'))) n = n + 1
+                   it = jnext(it)
+                end do
+             end if
+          end if
+          ev = jnext(ev)
+       end do
+       rl = jnext(rl)
+    end do
+  end function authorless_in_turn
 
   ! t_chunk / t_legacy: transcript handles (0 = unavailable)
   function api_consistency_record(t_chunk, t_legacy) result(r)
@@ -2098,7 +2351,7 @@ contains
     integer :: n, np
     if (.not. (jis_obj(t_chunk) .and. jis_obj(t_legacy))) then
        r = '{"name":"api-consistency","turnIndex":null,"rule":"transcripts built from the chunk and the legacy payload differ '// &
-           'only in citations[].url/kind","expected":{"format":"chunk","available":'//bool(jis_obj(t_chunk))// &
+           'only in citations[].url/kind '//RULE_X//'","expected":{"format":"chunk","available":'//bool(jis_obj(t_chunk))// &
            '},"actual":{"format":"legacy","available":'//bool(jis_obj(t_legacy))//'},"ok":false,"differences":[],'// &
            '"note":"one of the two payloads was not available, the cross-check could not be performed"}'
        return
@@ -2108,9 +2361,9 @@ contains
       call jcanon_value(w1, t_chunk); s1 = jw_result(w1)
       call jcanon_value(w2, t_legacy); s2 = jw_result(w2)
     end block
-    call diff_paths(t_chunk, t_legacy, 40, diffs, n, .true., np)
+    call diff_paths(drop_authorless_x(t_chunk), drop_authorless_x(t_legacy), 40, diffs, n, .true., np)
     r = '{"name":"api-consistency","turnIndex":null,"rule":"transcripts built from the chunk and the legacy payload differ '// &
-        'only in citations[].url/kind","expected":{"format":"chunk","sha256":'//q(sha256_hex(s1))//',"bytes":'//itoa(len(s1))// &
+        'only in citations[].url/kind '//RULE_X//'","expected":{"format":"chunk","sha256":'//q(sha256_hex(s1))//',"bytes":'//itoa(len(s1))// &
         '},"actual":{"format":"legacy","sha256":'//q(sha256_hex(s2))//',"bytes":'//itoa(len(s2))//'},"ok":'//bool(n == 0)// &
         ',"permittedDifferences":'//itoa(np)//',"differences":['//sb_str(diffs)//']}'
   end function api_consistency_record

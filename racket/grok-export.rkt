@@ -697,6 +697,10 @@
   (define t-parse (now-ms))
   (define fmt (transcript-format d))
   (define t (build-transcript d source-url))
+  (define merged (merge-ws-tool-results! t (unbox ws-frames)))
+  (set-box! api-xpost-ids (transcript-xpost-ids t))
+  (when (> merged 0)
+    (note! R "~a tool result(s) (command output) filled from the page's WebSocket history (raw/ws-history.json)" merged))
   (timing! R "parse" t-parse)
   (set-run-parsed-format! R fmt)
   (define conv (jget t 'conversation))
@@ -837,6 +841,32 @@
 
 (define CLOSE-ASIDE-JS
   "(() => { const b = document.querySelector('aside button[aria-label=\"Close\"]'); if (b) { b.click(); return true; } return false; })()")
+
+;; WebSocket history (agent tool output the REST responses lack): recorded by a script that runs before grok.com's
+;; own code (see fortran/js-src/grok-ws-hook.js, the same text), read back once the page has loaded the history.
+(define WS-HOOK-JS "(() => {\n  // grok.com streams each message's steps (with tool results such as command output) over wss://grok.com/ws/mgw as\n  // conversation.history.item events; the REST responses lack those results.  Keep those frames for the exporter.\n  if (window.__fxWsHooked) return;\n  window.__fxWsHooked = true;\n  window.__fxMgw = { items: [], done: false };\n  const Native = window.WebSocket;\n  class Recording extends Native {\n    constructor(url, protocols) {\n      super(url, protocols);\n      if (/\\/ws\\/mgw\\//.test(String(url))) {\n        this.addEventListener('message', (ev) => {\n          if (typeof ev.data !== 'string') return;\n          if (ev.data.indexOf('\"conversation.history.item\"') >= 0) window.__fxMgw.items.push(ev.data);\n          else if (ev.data.indexOf('\"conversation.history.done\"') >= 0) window.__fxMgw.done = true;\n        });\n      }\n    }\n  }\n  window.WebSocket = Recording;\n})();")
+(define WS-READ-JS "(() => { const m = window.__fxMgw; return m ? { done: !!m.done, items: m.items } : { done: false, items: null }; })()")
+(define ws-frames (box '()))
+;; X posts the transcript carries with an author (hydrate.rkt transcript-xpost-ids), for the DOM hydration check
+(define api-xpost-ids (box #f))
+
+(define (capture-ws-history! R c)
+  (define t0 (now-ms))
+  (define v
+    (let loop ()
+      (define r (with-handlers ([exn:fail? (lambda (e) (hasheq 'done #f 'items 'null))]) (cdp-eval c WS-READ-JS #:await #f #:timeout 60)))
+      (if (or (eq? (jget r 'done) #t) (> (- (now-ms) t0) 20000)) r (begin (sleep 0.5) (loop)))))
+  (define texts (filter string? (or-empty-list (jget v 'items))))
+  (define frames
+    (for*/list ([s (in-list texts)]
+                [f (in-value (with-handlers ([exn:fail? (lambda (e) #f)]) (string->jsexpr s)))]
+                #:when (hash? f))
+      f))
+  (set-box! ws-frames frames)
+  ;; kept verbatim: the frames exactly as the server sent them, as one JSON array
+  (when (pair? texts)
+    (queue-raw! R "raw/ws-history.json" (string->bytes/utf-8 (string-append "[" (string-join texts ",\n") "]\n"))))
+  (log-info "WebSocket history: ~a item(s), done ~a (~a ms)" (length frames) (jget v 'done) (- (now-ms) t0)))
 
 ;; Step 2: wait until the conversation is rendered (articles present and stable).
 (define (wait-for-conversation R c)
@@ -1240,7 +1270,7 @@
 ;; grok.com sometimes renders X posts without their hydration data (hydrate.rkt).  #t = accept the capture,
 ;; #f = it was rejected and the round has to be redone from a fresh navigation.
 (define (round-accept? R st attempt)
-  (define reason (capture-unhydrated? (rstate-capture st)))
+  (define reason (capture-unhydrated? (rstate-capture st) (unbox api-xpost-ids)))
   (cond
     [(and reason (< attempt DOM-HYDRATION-ATTEMPTS))
      (emit-string! R (format "raw/dom-capture-round~a.attempt~a-unhydrated.json" (rstate-k st) attempt)
@@ -1249,7 +1279,7 @@
             (rstate-k st) attempt DOM-HYDRATION-ATTEMPTS reason DOM-HYDRATION-DELAY-S)
      #f]
     [reason
-     (warn! R "DOM round ~a: ~a after ~a attempt(s); keeping the capture as rendered" (rstate-k st) reason attempt)
+     (warn! R "DOM round ~a: ~a after ~a attempts; keeping the capture as rendered" (rstate-k st) reason attempt)
      #t]
     [else #t]))
 
@@ -1298,8 +1328,8 @@
   cap)
 
 ;; One round, start to finish, on its own connection (used for a redo and for rounds 3..N).
-(define (round-sequential! R c url k shots?)
-  (let attempt-loop ([attempt 1])
+(define (round-sequential! R c url k shots? #:first-attempt [first-attempt 1])
+  (let attempt-loop ([attempt first-attempt])
     (define t0 (now-ms))
     (define href (round-navigate! R c url k attempt))
     (define st (make-round c k shots?))
@@ -1373,7 +1403,7 @@
                                      (warn! R "second tab for the concurrent DOM round could not be opened (~a); the rounds run one after the other"
                                             (exn-message e))
                                      (values #f #f))])
-          (define t (cdp-new-target "127.0.0.1" port "about:blank"))
+          (define t (cdp-new-window-target "127.0.0.1" port "about:blank"))
           (define cc (cdp-connect (jstr (jget t 'webSocketDebuggerUrl))))
           (cdp-call cc "Page.enable")
           (cdp-call cc "Runtime.enable")
@@ -1419,12 +1449,12 @@
             ;; rejected as unhydrated: the redo carries the screenshots only if the rejected round was the one
             ;; that took them (they came from a page rendered from a stripped payload and must be retaken)
             [else (sleep DOM-HYDRATION-DELAY-S)
-                  (define st (round-sequential! R c url 1 (rstate-shots? st1)))
+                  (define st (round-sequential! R c url 1 (rstate-shots? st1) #:first-attempt 2))
                   (when st (after-round1! R c st (+ (rstate-shots st) (if (rstate-shots? st1) 0 (rstate-shots st2)))))])
           (cond
             [(not (rstate-ok st2)) (warn! R "DOM round 2 failed: ~a" (or (rstate-error st2) "no capture"))]
             [(round-accept? R st2 1) (round-emit! R st2 href2 t0)]
-            [else (sleep DOM-HYDRATION-DELAY-S) (round-sequential! R c2 url 2 (rstate-shots? st2))])
+            [else (sleep DOM-HYDRATION-DELAY-S) (round-sequential! R c2 url 2 (rstate-shots? st2) #:first-attempt 2)])
           3]
          [else
           (define st (round-sequential! R c url 1 #t))
@@ -1931,6 +1961,9 @@
        (cdp-call c "Runtime.enable")
        (cdp-call c "Network.enable")
        (set-viewport! R c)
+       (set-box! ws-frames '()) (set-box! api-xpost-ids #f)
+       (with-handlers ([exn:fail? (lambda (e) (warn! R "WebSocket history hook could not be installed: ~a" (exn-message e)))])
+         (cdp-call c "Page.addScriptToEvaluateOnNewDocument" (hasheq 'source WS-HOOK-JS)))
        (define t-nav (now-ms))
        (phase! "Loading the conversation…" 0.08)
        (log-info "Navigating to ~a" url)
@@ -1938,6 +1971,7 @@
          (warn! R "Page.loadEventFired did not arrive within 60 s; polling anyway"))
        (define-values (final-url n-articles) (wait-for-conversation R c))
        (timing! R "navigate-and-wait" t-nav)
+       (capture-ws-history! R c)
        (set-run-final-url! R final-url)
        ;; step 3: API lane by final URL shape
        (define-values (kind id) (classify-url final-url))

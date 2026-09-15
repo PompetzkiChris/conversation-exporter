@@ -12,6 +12,7 @@
 
 (provide xposts-stripped?
          capture-unhydrated?
+         transcript-xpost-ids
          fetch-until-hydrated)
 
 ;; -> #f when the payload looks complete, else a string describing the first inconsistency:
@@ -48,14 +49,20 @@
 ;; The page renders from the same API: while the server serves the stripped payload, the
 ;; revealed X-post results in the Thoughts/Sources panels carry an empty user handle
 ;; (`https://x.com//status/<id>`) and a bare "@" title.  -> #f or a reason string.
-(define (capture-unhydrated? cap)
+;; known: the ids of the X posts the transcript carries with an author (transcript-xpost-ids).  When it is
+;; non-empty, a post outside it is one the API also serves without an author (a deleted or unavailable post):
+;; the page renders it with an empty handle however often it is reloaded, so it is not counted.
+(define (capture-unhydrated? cap [known #f])
   (define n 0)
+  (define (counts? u)
+    (or (not known) (zero? (hash-count known))
+        (let ([m (regexp-match #px"/status/([0-9]+)" u)]) (and m (hash-ref known (cadr m) #f)))))
   (define (scan-rows pan)
     (for* ([sec (in-list (or-empty-list (jget (or-empty-hash pan) 'sections)))]
            [r (in-list (or-empty-list (jget sec 'rows)))]
            [res (in-list (or-empty-list (jget r 'results)))])
       (define u (jget res 'url))
-      (when (and (string? u) (regexp-match? #px"^https?://(?:www\\.)?x\\.com//status/" u))
+      (when (and (string? u) (regexp-match? #px"^https?://(?:www\\.)?x\\.com//status/" u) (counts? u))
         (set! n (add1 n)))))
   (when (hash? cap)
     (for ([key (in-list '(thoughtsByArticle sourcesByArticle))])
@@ -63,3 +70,18 @@
         (scan-rows pan))))
   (and (> n 0)
        (format "~a revealed X-post result(s) have an empty user handle (https://x.com//status/...): the page was rendered from the unhydrated payload" n)))
+
+;; transcript -> hash of postId -> #t for every X post object carrying a non-empty username
+(define (transcript-xpost-ids t)
+  (define ids (make-hash))
+  (let walk ([v t])
+    (cond
+      [(hash? v)
+       (define pid (hash-ref v 'postId #f))
+       (define user (hash-ref v 'username #f))
+       (when (and (string? pid) (string? user) (not (string=? user "")))
+         (hash-set! ids pid #t))
+       (for ([x (in-hash-values v)]) (walk x))]
+      [(list? v) (for ([x (in-list v)]) (walk x))]
+      [else (void)]))
+  ids)

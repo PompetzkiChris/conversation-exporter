@@ -8,7 +8,7 @@ module fx_grok
   use fx_json
   implicit none
   private
-  public :: grok_transcript, grok_format, truthy, py_str
+  public :: grok_transcript, grok_format, truthy, py_str, grok_merge_ws_results
 
   character(len=*), parameter :: ASSET_BASE = 'https://assets.grok.com/'
   character(len=*), parameter :: SOLO_ROLLOUT = 'Grok'
@@ -54,6 +54,16 @@ module fx_grok
      integer :: url_node = 0
   end type gcit
 
+  ! searched-image card of a legacy reply (reference strip_images)
+  type :: gimg
+     integer :: offset = 0
+     character(len=:), allocatable :: cid, image_id, size
+     logical :: has_id = .false., has_size = .false.
+     integer :: img = 0                  ! the card's "image" object, 0 = none
+  end type gimg
+  type(gimg), allocatable :: imgs(:)
+  integer :: nimgs = 0
+
   ! per-turn state
   type(gevent), allocatable :: evs(:)
   integer :: nevs
@@ -69,6 +79,13 @@ module fx_grok
   integer, allocatable :: card_ev(:)
   integer :: ncards
 
+
+  type :: ws_key
+     character(len=:), allocatable :: s
+  end type ws_key
+  type(ws_key), allocatable, save :: ws_ids(:)
+  integer, allocatable, save :: ws_ce(:)
+  integer, save :: nws = 0
 
 contains
 
@@ -452,7 +469,7 @@ contains
     if (allocated(card_keys)) deallocate(card_keys)
     if (allocated(card_ev)) deallocate(card_ev)
     allocate(evs(64), rls(8), unattr(16), card_keys(16), card_ev(16))
-    nevs = 0; nrls = 0; nunattr = 0; ncards = 0
+    nevs = 0; nrls = 0; nunattr = 0; ncards = 0; nimgs = 0
   end subroutine reset_turn
 
   subroutine make_rollouts(ids)
@@ -976,6 +993,7 @@ contains
        msg = ''
     end if
     call strip_citations(msg, text, cits, ncits, ckeys, cval, nck)
+    call strip_images(text, cits, ncits, ckeys, cval, nck)
   contains
     subroutine grow_map(k, v, n)
       type(text_item_g), allocatable, intent(inout) :: k(:)
@@ -1075,6 +1093,158 @@ contains
     if (last <= len(msg)) call sb_add(o, msg(last:))
     text = sb_str(o)
   end subroutine strip_citations
+
+  ! Remove image-card markup from the (citation-stripped) reply text.  Each card becomes an imgs entry at its
+  ! character offset; citation offsets at or after the end of a card move back by its length.
+  subroutine strip_images(text, cits, ncits, ckeys, cval, nck)
+    character(len=:), allocatable, intent(inout) :: text
+    type(gcit), allocatable, intent(inout) :: cits(:)
+    integer, intent(in) :: ncits
+    type(text_item_g), intent(in) :: ckeys(:)
+    integer, intent(in) :: cval(:), nck
+    character(len=*), parameter :: p1 = '<grok:render card_id="'
+    character(len=*), parameter :: p2 = '" card_type="image_card" type="render_searched_image">'
+    character(len=*), parameter :: pa = '<argument name="', pb = '">', pc = '</argument>', p3 = '</grok:render>'
+    type(strbuf) :: o
+    integer, allocatable :: cut_end(:), cut_n(:)
+    integer :: last, i, a, h, k, e, nm, ve, card, removed, ncut, n, j
+    character(len=:), allocatable :: nm_s, val
+    type(gimg), allocatable :: grow(:)
+    if (index(text, p1) == 0) return
+    allocate(cut_end(16), cut_n(16)); ncut = 0
+    if (.not. allocated(imgs)) allocate(imgs(8))
+    last = 1; i = 1; removed = 0
+    do
+       a = index(text(i:), p1)
+       if (a == 0) exit
+       a = i + a - 1
+       h = a + len(p1)
+       do while (h <= len(text))
+          if (index('0123456789abcdefABCDEF', text(h:h)) == 0) exit
+          h = h + 1
+       end do
+       if (h == a + len(p1) .or. h + len(p2) - 1 > len(text)) then
+          i = a + 1; cycle
+       end if
+       if (text(h:h+len(p2)-1) /= p2) then
+          i = a + 1; cycle
+       end if
+       ! zero or more <argument name="[a-z_]+">[^<]*</argument>, then </grok:render>
+       k = h + len(p2)
+       do
+          if (k + len(pa) - 1 > len(text)) exit
+          if (text(k:k+len(pa)-1) /= pa) exit
+          nm = k + len(pa)
+          do while (nm <= len(text))
+             if (index('abcdefghijklmnopqrstuvwxyz_', text(nm:nm)) == 0) exit
+             nm = nm + 1
+          end do
+          if (nm == k + len(pa) .or. nm + len(pb) - 1 > len(text)) exit
+          if (text(nm:nm+len(pb)-1) /= pb) exit
+          ve = nm + len(pb)
+          do while (ve <= len(text))
+             if (text(ve:ve) == '<') exit
+             ve = ve + 1
+          end do
+          if (ve + len(pc) - 1 > len(text)) exit
+          if (text(ve:ve+len(pc)-1) /= pc) exit
+          k = ve + len(pc)
+       end do
+       if (k + len(p3) - 1 > len(text)) then
+          i = a + 1; cycle
+       end if
+       if (text(k:k+len(p3)-1) /= p3) then
+          i = a + 1; cycle
+       end if
+       e = k + len(p3) - 1                    ! the card is text(a:e)
+       if (a > last) call sb_add(o, text(last:a-1))
+       if (nimgs >= size(imgs)) then
+          allocate(grow(2*size(imgs))); grow(1:nimgs) = imgs(1:nimgs); call move_alloc(grow, imgs)
+       end if
+       nimgs = nimgs + 1
+       imgs(nimgs) = gimg()
+       imgs(nimgs)%offset = nchars(text(1:a-1)) - removed
+       imgs(nimgs)%cid = to_lower_s(text(a+len(p1):h-1))
+       ! arguments (a repeated name: the last one wins)
+       j = h + len(p2)
+       do while (j < k)
+          nm = j + len(pa)
+          ve = index(text(nm:), pb) + nm - 1
+          nm_s = text(nm:ve-1)
+          val = text(ve+len(pb):index(text(ve:), pc) + ve - 2)
+          if (nm_s == 'image_id') then
+             imgs(nimgs)%image_id = val; imgs(nimgs)%has_id = .true.
+          else if (nm_s == 'size') then
+             imgs(nimgs)%size = val; imgs(nimgs)%has_size = .true.
+          end if
+          j = index(text(ve:), pc) + ve - 1 + len(pc)
+       end do
+       card = 0
+       do n = 1, nck
+          if (ckeys(n)%s == imgs(nimgs)%cid) card = cval(n)
+       end do
+       if (card > 0) then
+          if (jis_obj(jget(card, 'image'))) imgs(nimgs)%img = jget(card, 'image')
+       end if
+       n = nchars(text(a:e))
+       if (ncut >= size(cut_end)) then
+          cut_end = [cut_end, cut_end]; cut_n = [cut_n, cut_n]
+       end if
+       ncut = ncut + 1; cut_end(ncut) = nchars(text(1:e)); cut_n(ncut) = n
+       removed = removed + n
+       last = e + 1; i = e + 1
+    end do
+    if (ncut == 0) return
+    if (last <= len(text)) call sb_add(o, text(last:))
+    text = sb_str(o)
+    if (.not. allocated(cits)) return
+    do j = 1, ncits
+       n = 0
+       do k = 1, ncut
+          if (cut_end(k) <= cits(j)%offset) n = n + cut_n(k)
+       end do
+       cits(j)%offset = cits(j)%offset - n
+    end do
+  end subroutine strip_images
+
+  subroutine write_images(w)
+    type(jw), intent(inout) :: w
+    integer :: i
+    call jw_begin_arr(w)
+    do i = 1, nimgs
+       call jw_begin_obj(w)
+       call jw_key(w, 'cardId'); call jw_str(w, imgs(i)%cid)
+       call jw_key(w, 'imageId')
+       if (imgs(i)%has_id) then
+          call jw_str(w, imgs(i)%image_id)
+       else
+          call jw_null(w)
+       end if
+       call jw_key(w, 'link'); call img_field('link')
+       call jw_key(w, 'offset'); call jw_int(w, int(imgs(i)%offset, int64))
+       call jw_key(w, 'size')
+       if (imgs(i)%has_size) then
+          call jw_str(w, imgs(i)%size)
+       else
+          call jw_null(w)
+       end if
+       call jw_key(w, 'source'); call img_field('source')
+       call jw_key(w, 'thumbnail'); call img_field('thumbnail')
+       call jw_key(w, 'title'); call img_field('title')
+       call jw_key(w, 'url'); call img_field('original')
+       call jw_end_obj(w)
+    end do
+    call jw_end_arr(w)
+  contains
+    subroutine img_field(k)
+      character(len=*), intent(in) :: k
+      if (imgs(i)%img > 0) then
+         call jcanon_value(w, jget(imgs(i)%img, k))
+      else
+         call jw_null(w)
+      end if
+    end subroutine img_field
+  end subroutine write_images
 
   subroutine write_citations(w, cits, ncits)
     type(jw), intent(inout) :: w
@@ -1254,6 +1424,9 @@ contains
     if (truthy(jget(r, 'imageEditUris'))) then
        call jw_key(w, 'imageEditUris'); call jcanon_value(w, jget(r, 'imageEditUris'))
     end if
+    if (.not. human .and. nimgs > 0) then
+       call jw_key(w, 'images'); call write_images(w)
+    end if
     call jw_key(w, 'index'); call jw_int(w, int(idx, int64))
     call jw_key(w, 'model')
     if (truthy(jget(r, 'model'))) then
@@ -1421,6 +1594,61 @@ contains
     end subroutine grow_stack
   end subroutine order_responses
 
+  ! off(i): order(i) is not on the current branch.  Where a response has several children (an edited message, a
+  ! regenerated reply), the last child in array order is the version the page shows; every earlier child and all
+  ! of its descendants are off the branch.  Children of an unknown parent (roots) are never split.
+  subroutine off_branch_flags(responses, order, n, off)
+    integer, intent(in) :: responses, n
+    integer, intent(in) :: order(:)
+    logical, allocatable, intent(out) :: off(:)
+    type(text_item_g), allocatable :: rid(:), pid(:)
+    logical, allocatable :: offr(:)
+    integer, allocatable :: stack(:)
+    integer :: m, c, i, j, last, sp, top
+    m = jlen(responses)
+    allocate(off(max(n,1)), rid(max(m,1)), pid(max(m,1)), offr(max(m,1)), stack(max(m*m+m,4)))
+    off = .false.; offr = .false.
+    c = jfirst(responses); i = 0
+    do while (c > 0)
+       i = i + 1
+       rid(i)%s = key_text(jget(c, 'responseId')); pid(i)%s = key_text(jget(c, 'parentResponseId'))
+       c = jnext(c)
+    end do
+    sp = 0
+    do i = 1, m
+       ! children of response i, only once per distinct id (the by-id entry is the last with this id)
+       if (any([(rid(j)%s == rid(i)%s, j = i + 1, m)])) cycle
+       last = 0
+       do j = 1, m
+          if (pid(j)%s == rid(i)%s) last = j
+       end do
+       if (last == 0) cycle
+       do j = 1, last - 1
+          if (pid(j)%s == rid(i)%s .and. rid(j)%s /= rid(last)%s) then
+             sp = sp + 1; stack(sp) = j
+          end if
+       end do
+    end do
+    do while (sp > 0)
+       top = stack(sp); sp = sp - 1
+       if (any(offr(1:m) .and. [(rid(j)%s == rid(top)%s, j = 1, m)])) cycle
+       do j = 1, m
+          if (rid(j)%s == rid(top)%s) offr(j) = .true.
+       end do
+       do j = m, 1, -1
+          if (pid(j)%s == rid(top)%s) then
+             sp = sp + 1; stack(sp) = j
+          end if
+       end do
+    end do
+    do i = 1, n
+       c = order(i)
+       do j = 1, m
+          if (offr(j) .and. rid(j)%s == key_text(jget(c, 'responseId'))) off(i) = .true.
+       end do
+    end do
+  end subroutine off_branch_flags
+
   ! "chunk" if any response has non-empty outputChunks
   function grok_format(d) result(fmt)
     integer, intent(in) :: d
@@ -1443,7 +1671,8 @@ contains
     character(len=:), allocatable, intent(out) :: out_text
     type(jw) :: w
     integer, allocatable :: order(:)
-    integer :: n, i, cv
+    logical, allocatable :: off(:)
+    integer :: n, i, k, cv
     cv = hash_or_empty(conv)
     call jw_begin_obj(w)
     call jw_key(w, 'conversation')
@@ -1470,15 +1699,195 @@ contains
     end if
     call jw_key(w, 'title'); call jcanon_value(w, jget(cv, 'title'))
     call jw_end_obj(w)
+    call order_responses(list_or_empty(jget(d, 'responses')), order, n)
+    call off_branch_flags(list_or_empty(jget(d, 'responses')), order, n, off)
+    ! offBranchTurns (sorted before "turns"): edited messages and regenerated replies, only when there are any
+    if (count(off(1:n)) > 0) then
+       call jw_key(w, 'offBranchTurns')
+       call jw_begin_arr(w)
+       k = 0
+       do i = 1, n
+          if (.not. off(i)) cycle
+          call write_turn(w, order(i), k); k = k + 1
+       end do
+       call jw_end_arr(w)
+    end if
     call jw_key(w, 'turns')
     call jw_begin_arr(w)
-    call order_responses(list_or_empty(jget(d, 'responses')), order, n)
+    k = 0
     do i = 1, n
-       call write_turn(w, order(i), i - 1)
+       if (off(i)) cycle
+       call write_turn(w, order(i), k); k = k + 1
     end do
     call jw_end_arr(w)
     call jw_end_obj(w)
     out_text = jw_result(w)
   end subroutine grok_transcript
+
+  ! ------------------------------------------------------------------ WebSocket tool results
+  ! grok.com's REST responses carry no output for agent tools such as bash (results null).  The page receives it over
+  ! wss://grok.com/ws/mgw as conversation.history.item events: item.x_grok.output_chunks[].tool_result
+  ! {tool_call_id, code_execution {stdout, exit_code}}.  frames: JSON array of the frames the page got.
+  ! Fills the results of tool events that have none with {exitCode, items [], kind "code", stdout}; same rules as
+  ! racket/transcript.rkt merge-ws-tool-results! (turns[].thinking.rollouts[].events[] only; last frame wins).
+  subroutine grok_merge_ws_results(text, frames, out_text, nmerged)
+    character(len=*), intent(in) :: text
+    integer, intent(in) :: frames
+    character(len=:), allocatable, intent(out) :: out_text
+    integer, intent(out) :: nmerged
+    type(jw) :: w
+    integer :: f, ev, xg, ch, tr, t, i
+    nmerged = 0
+    nws = 0
+    if (allocated(ws_ids)) deallocate(ws_ids)
+    if (allocated(ws_ce)) deallocate(ws_ce)
+    allocate(ws_ids(256), ws_ce(256))
+    f = jfirst(frames)
+    do while (f > 0)
+       ev = jget(f, 'event')
+       if (jis_obj(f) .and. jis_obj(ev)) then
+          if (jequal_str(jget(ev, 'type'), 'conversation.history.item')) then
+             xg = jget(jget(ev, 'item'), 'x_grok')
+             if (jis_obj(jget(ev, 'item')) .and. jis_obj(xg)) then
+                if (jis_arr(jget(xg, 'output_chunks'))) then
+                   ch = jfirst(jget(xg, 'output_chunks'))
+                   do while (ch > 0)
+                      tr = 0
+                      if (jis_obj(ch)) tr = jget(ch, 'tool_result')
+                      if (jis_obj(tr)) then
+                         if (jis_str(jget(tr, 'tool_call_id')) .and. jis_obj(jget(tr, 'code_execution'))) &
+                            call ws_put(jstr(jget(tr, 'tool_call_id')), jget(tr, 'code_execution'))
+                      end if
+                      ch = jnext(ch)
+                   end do
+                end if
+             end if
+          end if
+       end if
+       f = jnext(f)
+    end do
+    t = jparse(text)
+    call ws_write(w, t, 0, nmerged)
+    out_text = jw_result(w)
+  contains
+    subroutine ws_put(id, ce)
+      character(len=*), intent(in) :: id
+      integer, intent(in) :: ce
+      type(ws_key), allocatable :: tmp(:)
+      integer, allocatable :: tmpc(:)
+      do i = 1, nws
+         if (ws_ids(i)%s == id) then
+            ws_ce(i) = ce; return
+         end if
+      end do
+      if (nws >= size(ws_ids)) then
+         allocate(tmp(2*nws), tmpc(2*nws)); tmp(1:nws) = ws_ids(1:nws); tmpc(1:nws) = ws_ce(1:nws)
+         call move_alloc(tmp, ws_ids); call move_alloc(tmpc, ws_ce)
+      end if
+      nws = nws + 1; ws_ids(nws)%s = id; ws_ce(nws) = ce
+    end subroutine ws_put
+  end subroutine grok_merge_ws_results
+
+  integer function ws_find(p)
+    integer, intent(in) :: p
+    integer :: i
+    ws_find = 0
+    if (.not. jis_str(p)) return
+    do i = 1, nws
+       if (ws_ids(i)%s == jstr(p)) then
+          ws_find = ws_ce(i); return
+       end if
+    end do
+  end function ws_find
+
+  ! level 0 transcript, 1 turn, 2 thinking, 3 rollout, 4 event
+  recursive subroutine ws_write(w, p, level, nmerged)
+    type(jw), intent(inout) :: w
+    integer, intent(in) :: p, level
+    integer, intent(inout) :: nmerged
+    integer, allocatable :: kids(:)
+    integer :: n, i, j, t, c, ce
+    character(len=:), allocatable :: k
+    logical :: replace, wrote
+    if (.not. jis_obj(p)) then
+       call jcanon_value(w, p); return
+    end if
+    n = jlen(p); allocate(kids(max(n,1)))
+    c = jfirst(p); i = 0
+    do while (c > 0)
+       i = i + 1; kids(i) = c; c = jnext(c)
+    end do
+    do i = 2, n
+       t = kids(i); j = i - 1
+       do while (j >= 1)
+          if (.not. lgt(jname(kids(j)), jname(t))) exit
+          kids(j+1) = kids(j); j = j - 1
+       end do
+       kids(j+1) = t
+    end do
+    ce = 0
+    if (level == 4) then
+       if (jequal_str(jget(p, 'type'), 'tool') .and. (jget(p, 'results') == 0 .or. jis_null(jget(p, 'results')))) &
+          ce = ws_find(jget(p, 'toolCallId'))
+    end if
+    replace = (ce > 0)
+    if (replace) nmerged = nmerged + 1
+    call jw_begin_obj(w)
+    wrote = .false.
+    do i = 1, n
+       k = jname(kids(i))
+       if (replace .and. .not. wrote .and. lgt(k, 'results')) then
+          call put_code(); wrote = .true.
+       end if
+       call jw_key(w, k)
+       if (replace .and. k == 'results') then
+          call put_code_value(); wrote = .true.
+       else if (level == 0 .and. (k == 'turns' .or. k == 'offBranchTurns') .and. jis_arr(kids(i))) then
+          call each(kids(i), 1)
+       else if (level == 1 .and. k == 'thinking' .and. jis_obj(kids(i))) then
+          call ws_write(w, kids(i), 2, nmerged)
+       else if (level == 2 .and. k == 'rollouts' .and. jis_arr(kids(i))) then
+          call each(kids(i), 3)
+       else if (level == 3 .and. k == 'events' .and. jis_arr(kids(i))) then
+          call each(kids(i), 4)
+       else
+          call jcanon_value(w, kids(i))
+       end if
+    end do
+    if (replace .and. .not. wrote) call put_code()
+    call jw_end_obj(w)
+  contains
+    recursive subroutine each(arr, lv)
+      integer, intent(in) :: arr, lv
+      integer :: e
+      call jw_begin_arr(w)
+      e = jfirst(arr)
+      do while (e > 0)
+         call ws_write(w, e, lv, nmerged)
+         e = jnext(e)
+      end do
+      call jw_end_arr(w)
+    end subroutine each
+    subroutine put_code()
+      call jw_key(w, 'results')
+      call put_code_value()
+    end subroutine put_code
+    subroutine put_code_value()
+      call jw_begin_obj(w)
+      call jw_key(w, 'exitCode'); call opt(jget(ce, 'exit_code'))
+      call jw_key(w, 'items'); call jw_begin_arr(w); call jw_end_arr(w)
+      call jw_key(w, 'kind'); call jw_str(w, 'code')
+      call jw_key(w, 'stdout'); call opt(jget(ce, 'stdout'))
+      call jw_end_obj(w)
+    end subroutine put_code_value
+    subroutine opt(v)
+      integer, intent(in) :: v
+      if (v == 0) then
+        call jw_null(w)
+      else
+        call jcanon_value(w, v)
+      end if
+    end subroutine opt
+  end subroutine ws_write
 
 end module fx_grok

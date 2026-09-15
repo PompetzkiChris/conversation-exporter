@@ -8,6 +8,7 @@
          json)
 
 (provide build-transcript
+         merge-ws-tool-results!
          transcript-format
          jget jhas? truthy? py-or py-str jstr
          or-empty-list or-empty-hash
@@ -241,6 +242,29 @@
       (set! ordered (cons r ordered))))
   (reverse ordered))
 
+;; Ids not on the current branch.  Where a response has several children (an edited message, a regenerated
+;; reply), the last child in array order is the version the page shows; every earlier child and all of its
+;; descendants are off the branch.  Children of an unknown parent (roots) are never split.
+(define (off-branch-ids responses)
+  (define by-id (make-hash))
+  (for ([r (in-list responses)]) (hash-set! by-id (jget r 'responseId) #t))
+  (define children (make-hash))   ; parent -> ids (reversed)
+  (for ([r (in-list responses)])
+    (hash-update! children (jget r 'parentResponseId) (lambda (l) (cons (jget r 'responseId) l)) '()))
+  (define off (make-hash))
+  (let loop ([stack (for*/list ([(p ch) (in-hash children)]
+                                #:when (and (hash-has-key? by-id p) (>= (length ch) 2))
+                                [k (in-list (cdr ch))]
+                                #:unless (equal? k (car ch)))
+                      k)])
+    (unless (null? stack)
+      (define rid (car stack))
+      (cond
+        [(hash-has-key? off rid) (loop (cdr stack))]
+        [else (hash-set! off rid #t)
+              (loop (append (hash-ref children rid '()) (cdr stack)))])))
+  off)
+
 ;; ------------------------------------------------------------------ rollouts
 (struct rl (id role [events #:mutable]))          ; events stored reversed
 (struct rollouts (ids main by-id [order #:mutable] cards [unattributed #:mutable]))
@@ -364,7 +388,7 @@
                           cits)))]
       [(jhas? c 'uiLayout) (void)]
       [else (add-unknown! R rname c)]))
-  (values (apply string-append (reverse parts)) (reverse cits)))
+  (values (apply string-append (reverse parts)) (reverse cits) '()))
 
 (define CITE-RX
   #px"<grok:render card_id=\"([0-9a-fA-F]+)\" card_type=\"citation_card\" type=\"render_inline_citation\"><argument name=\"citation_id\">([0-9]+)</argument></grok:render>")
@@ -431,7 +455,45 @@
                                 'url (if card (jget card 'url) 'null))
                         cits))
        (loop (cdr ms) (cdr whole) pos*)]))
-  (values (get-output-string out) (reverse cits)))
+  (strip-images (get-output-string out) (reverse cits) cards))
+
+;; searched-image cards in legacy reply text: <grok:render card_id="68042e" card_type="image_card"
+;; type="render_searched_image"><argument name="image_id">W9RU3</argument>…</grok:render>
+(define IMG-RX
+  #px"<grok:render card_id=\"([0-9a-fA-F]+)\" card_type=\"image_card\" type=\"render_searched_image\">((?:<argument name=\"[a-z_]+\">[^<]*</argument>)*)</grok:render>")
+(define ARG-RX #px"<argument name=\"([a-z_]+)\">([^<]*)</argument>")
+
+;; Remove image-card markup from the (citation-stripped) reply text -> (values text citations images).
+;; Each card becomes an images entry at its character offset; citation offsets at or after the end of a
+;; card move back by its length.  Reference: strip_images.
+(define (strip-images text cits cards)
+  (define ms (regexp-match-positions* IMG-RX text #:match-select values))
+  (define out (open-output-string))
+  (define-values (images cuts)
+    (for/fold ([imgs '()] [cuts '()] [last 0] [removed 0] #:result (values (reverse imgs) cuts))
+              ([m (in-list ms)])
+      (define whole (car m))
+      (write-string text out last (car whole))
+      (define cid (string-downcase (substring text (car (cadr m)) (cdr (cadr m)))))
+      (define args (for/hash ([a (in-list (regexp-match* ARG-RX (substring text (car (caddr m)) (cdr (caddr m))) #:match-select cdr))])
+                     (values (car a) (cadr a))))
+      (define card (hash-ref cards cid #f))
+      (define img (if (and card (hash? (jget card 'image))) (jget card 'image) (hasheq)))
+      (define n (- (cdr whole) (car whole)))
+      (values (cons (hasheq 'offset (- (car whole) removed) 'cardId cid
+                            'imageId (hash-ref args "image_id" 'null) 'size (hash-ref args "size" 'null)
+                            'title (jget img 'title) 'source (jget img 'source) 'link (jget img 'link)
+                            'url (jget img 'original) 'thumbnail (jget img 'thumbnail))
+                    imgs)
+              (cons (cons (cdr whole) n) cuts)
+              (cdr whole)
+              (+ removed n))))
+  (write-string text out (if (null? ms) 0 (cdr (car (last ms)))))
+  (values (get-output-string out)
+          (for/list ([c (in-list cits)])
+            (define o (jget c 'offset))
+            (hash-set c 'offset (- o (for/sum ([cut (in-list cuts)] #:when (<= (car cut) o)) (cdr cut)))))
+          images))
 
 ;; numeric citation kind in cardAttachmentsJson -> the enum name used by the chunk format's
 ;; renderCitation (reference CITATION_KINDS); any other value -> 'null.
@@ -520,12 +582,13 @@
                     (jget (or-empty-hash (jget (or-empty-hash (jget r 'metadata)) 'ui_layout))
                           'rollout_ids)))))
      (define R (make-rollouts (or-empty-list (jget layout 'rolloutIds))))
-     (define-values (text citations)
+     (define-values (text citations images)
        (if (truthy? (jget r 'outputChunks))
            (assistant-from-chunks r R)
            (assistant-from-steps r R)))
      (hash-set! turn 'text text)
      (hash-set! turn 'citations citations)
+     (when (pair? images) (hash-set! turn 'images images))
      (define rlist (rollouts-list R))
      (hash-set! turn 'thinking
                 (hasheq 'startTime (jget r 'thinkingStartTime)
@@ -554,11 +617,45 @@
             'modifyTime (jget conv 'modifyTime)
             'sourceUrl (if (string? source-url) source-url 'null)
             'isPublic (if (jhas? d 'isPublic) (jget d 'isPublic) 'null)))
+  (define responses (or-empty-list (jget d 'responses)))
+  (define off (off-branch-ids responses))
+  (define ordered (order-responses responses))
+  (define (on? r) (not (hash-has-key? off (jget r 'responseId))))
   (define turns
-    (for/list ([r (in-list (order-responses (or-empty-list (jget d 'responses))))]
-               [idx (in-naturals)])
+    (for/list ([r (in-list (filter on? ordered))] [idx (in-naturals)])
       (build-turn r idx)))
-  (hasheq 'conversation out-conv 'turns turns))
+  (define others
+    (for/list ([r (in-list (filter (lambda (r) (not (on? r))) ordered))] [idx (in-naturals)])
+      (build-turn r idx)))
+  (if (null? others)
+      (hasheq 'conversation out-conv 'turns turns)
+      (hasheq 'conversation out-conv 'turns turns 'offBranchTurns others)))
+
+;; ------------------------------------------------------------------ WebSocket tool results
+;; grok.com's REST responses carry no output for agent tools such as bash (their results are null).  The page
+;; receives it over wss://grok.com/ws/mgw as conversation.history.item events, whose item.x_grok.output_chunks[]
+;; hold tool_result {tool_call_id, code_execution {stdout, exit_code}}.  frames: the parsed frames the page got.
+;; Fills the results of tool events that have none with {kind "code", items [], stdout, exitCode}; -> count.
+(define (merge-ws-tool-results! t frames)
+  (define by-id (make-hash))
+  (for ([f (in-list frames)])
+    (define ev (or-empty-hash (jget (or-empty-hash f) 'event)))
+    (when (equal? (jget ev 'type) "conversation.history.item")
+      (define xg (or-empty-hash (jget (or-empty-hash (jget ev 'item)) 'x_grok)))
+      (for ([ch (in-list (or-empty-list (jget xg 'output_chunks)))])
+        (define tr (jget (or-empty-hash ch) 'tool_result))
+        (when (and (hash? tr) (string? (jget tr 'tool_call_id)) (hash? (jget tr 'code_execution)))
+          (hash-set! by-id (jget tr 'tool_call_id) (jget tr 'code_execution))))))
+  (for*/sum ([turn (in-list (append (or-empty-list (jget t 'turns)) (or-empty-list (jget t 'offBranchTurns))))]
+             [rl (in-list (or-empty-list (jget (or-empty-hash (jget turn 'thinking)) 'rollouts)))]
+             [ev (in-list (or-empty-list (jget rl 'events)))])
+    (define ce (and (hash? ev) (equal? (jget ev 'type) "tool") (eq? (jget ev 'results) 'null)
+                    (hash-ref by-id (jget ev 'toolCallId) #f)))
+    (cond
+      [(and ce (not (immutable? ev)))
+       (hash-set! ev 'results (hasheq 'kind "code" 'items '() 'stdout (jget ce 'stdout) 'exitCode (jget ce 'exit_code)))
+       1]
+      [else 0])))
 
 ;; "chunk" when at least one response has a non-empty outputChunks, else "legacy".
 (define (transcript-format d)

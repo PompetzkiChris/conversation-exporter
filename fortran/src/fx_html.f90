@@ -69,8 +69,8 @@ contains
     character(len=:), allocatable, intent(out) :: out_text
     character(len=*), intent(in), optional :: generator
     type(strbuf) :: o
-    character(len=:), allocatable :: gen, title, idx, rel, mime, u
-    integer :: c, tn, turn, p, atts, a, th, rl, ev, cits, ci, n, s, webs, xs, w, x
+    character(len=:), allocatable :: gen, title, idx, rel, mime, u, tl
+    integer :: c, tn, turn, p, atts, a, th, rl, ev, cits, ci, n, s, webs, xs, w, x, ipass, im
     logical :: found
 
     if (present(generator)) then
@@ -99,12 +99,25 @@ contains
     if (.not. jis_null(p)) call sb_add(o, DOT//'Public '//py_str(p))
     call sb_add(o, '</div>'//NL)
 
-    turn = jfirst(lst(jget(t, 'turns')))
+    ! offBranchTurns (edited messages, regenerated replies) follow the current branch under their own heading
+    do ipass = 1, 2
+    if (ipass == 1) then
+       turn = jfirst(lst(jget(t, 'turns')))
+    else
+       turn = jfirst(lst(jget(t, 'offBranchTurns')))
+       if (turn > 0) call sb_add(o, '<h2 class="other-versions">Other versions</h2>'//NL// &
+          '<div class="meta">Edited messages and regenerated replies that are not on the current branch of the '// &
+          'conversation (the branch the page shows).</div>'//NL)
+    end if
     do while (turn > 0)
-       idx = disp(jget(turn, 'index'))
+       if (ipass == 1) then
+          idx = disp(jget(turn, 'index')); tl = 'turn '//idx
+       else
+          idx = 'o'//disp(jget(turn, 'index')); tl = 'other version '//disp(jget(turn, 'index'))
+       end if
        if (node_is(jget(turn, 'sender'), 'human')) then
           call sb_add(o, '<section class="turn user" id="turn-'//idx//'">'//NL)
-          call sb_add(o, '<div class="turn-head">User <span class="ts">turn '//idx//DOT//escn(jget(turn, 'createTime'))// &
+          call sb_add(o, '<div class="turn-head">User <span class="ts">'//tl//DOT//escn(jget(turn, 'createTime'))// &
                          '</span></div>'//NL)
           call sb_add(o, image_surfaces_html(turn))
           atts = lst(jget(turn, 'attachments'))
@@ -135,7 +148,7 @@ contains
        else
           th = hsh(jget(turn, 'thinking'))
           call sb_add(o, '<section class="turn assistant" id="turn-'//idx//'">'//NL)
-          call sb_add(o, '<div class="turn-head">Grok <span class="ts">turn '//idx//DOT//escn(jget(turn, 'createTime'))// &
+          call sb_add(o, '<div class="turn-head">Grok <span class="ts">'//tl//DOT//escn(jget(turn, 'createTime'))// &
                          DOT//'model '//escn(jget(turn, 'model'))//'</span></div>'//NL)
           call sb_add(o, image_surfaces_html(turn))
           call sb_add(o, '<div class="section-title">Thoughts ('//escn(jget(th, 'durationMs'))//' ms)</div>'//NL)
@@ -177,6 +190,17 @@ contains
              end do
              call sb_add(o, '</ol>'//NL)
           end if
+          if (jlen(lst(jget(turn, 'images'))) > 0) then
+             call sb_add(o, '<div class="attachments">'//NL)
+             im = jfirst(lst(jget(turn, 'images')))
+             do while (im > 0)
+                call sb_add(o, '<figure><a href="'//escn(jget(im, 'link'))//'"><img src="'//escn(jget(im, 'url'))//'" alt="'// &
+                               escn(jget(im, 'title'))//'" loading="lazy"></a><figcaption>'//escn(jget(im, 'title'))//DOT// &
+                               escn(jget(im, 'source'))//'</figcaption></figure>'//NL)
+                im = jnext(im)
+             end do
+             call sb_add(o, '</div>'//NL)
+          end if
           s = hsh(jget(turn, 'sources'))
           webs = lst(jget(s, 'webSearchResults'))
           xs = lst(jget(s, 'xposts'))
@@ -199,6 +223,7 @@ contains
           call sb_add(o, '</ul></div>'//NL//'</section>'//NL)
        end if
        turn = jnext(turn)
+    end do
     end do
     call sb_add(o, '</main>'//NL//'</body>'//NL//'</html>'//NL)
     out_text = sb_str(o)
@@ -995,6 +1020,14 @@ contains
        cmd = arg_str(a, 'command')
        r = tool_head(label, one_line_s(arg_str(a, 'description')), nitems)
        if (len(cmd) > 0) r = r//pre_block(cmd)
+       ! command output (WebSocket history, see fx_grok grok_merge_ws_results)
+       if (jequal_str(jget(res, 'kind'), 'code') .and. jis_str(jget(res, 'stdout'))) then
+          if (jis_int(jget(res, 'exitCode'))) then
+             r = r//sub_line('Output (exit code '//num_text(jget(res, 'exitCode'))//'):')//pre_block(jstr(jget(res, 'stdout')))
+          else
+             r = r//sub_line('Output:')//pre_block(jstr(jget(res, 'stdout')))
+          end if
+       end if
     else if (streq(k, 'editFile')) then
        fp = arg_str(a, 'filePath', 'file_path')
        olds = arg_str(a, 'oldString', 'old_string')

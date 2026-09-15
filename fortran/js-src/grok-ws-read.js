@@ -1,0 +1,1 @@
+(() => { const m = window.__fxMgw; return m ? { done: !!m.done, items: m.items } : { done: false, items: null }; })()

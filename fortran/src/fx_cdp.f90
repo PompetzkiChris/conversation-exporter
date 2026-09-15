@@ -6,7 +6,7 @@ module fx_cdp
   use fx_net
   implicit none
   private
-  public :: cdp, cdp_version_ok, cdp_new_tab, cdp_close_tab, cdp_connect, cdp_call, cdp_eval, &
+  public :: cdp, cdp_version_ok, cdp_new_tab, cdp_new_window, cdp_close_tab, cdp_connect, cdp_call, cdp_eval, &
             cdp_run_function, cdp_disconnect
 
   type :: cdp
@@ -39,6 +39,43 @@ contains
     id = jstr(jget(root, 'id')); wsurl = jstr(jget(root, 'webSocketDebuggerUrl'))
     ok = (len(id) > 0 .and. len(wsurl) > 0)
   end subroutine cdp_new_tab
+
+  ! A page in its own browser window (Target.createTarget newWindow).  A tab behind another tab of the same
+  ! window is hidden and stops rendering (no requestAnimationFrame, no IntersectionObserver), so a page that
+  ! loads older content when scrolled to the top never loads it there; a separate window keeps rendering.
+  subroutine cdp_new_window(port, url, id, wsurl, ok)
+    integer, intent(in) :: port
+    character(len=*), intent(in) :: url
+    character(len=:), allocatable, intent(out) :: id, wsurl
+    logical, intent(out) :: ok
+    type(cdp) :: bc
+    integer :: st, root, r, k, e
+    character(len=:), allocatable :: body
+    ok = .false.; id = ''; wsurl = ''
+    call http_request(port, 'GET', '/json/version', st, body)
+    if (st /= 200) return
+    root = jparse(body)
+    if (.not. cdp_connect(bc, jstr(jget(root, 'webSocketDebuggerUrl')), 10000)) return
+    r = cdp_call(bc, 'Target.createTarget', '{"url":'//jquote(url)//',"newWindow":true}')
+    if (r > 0) then
+       if (jis_str(jget(jget(r, 'result'), 'targetId'))) id = jstr(jget(jget(r, 'result'), 'targetId'))
+    end if
+    call cdp_disconnect(bc)
+    if (len(id) == 0) return
+    do k = 1, 40
+       call http_request(port, 'GET', '/json/list', st, body)
+       if (st == 200) then
+          e = jfirst(jparse(body))
+          do while (e > 0)
+             if (jequal_str(jget(e, 'id'), id)) then
+                wsurl = jstr(jget(e, 'webSocketDebuggerUrl')); ok = (len(wsurl) > 0); return
+             end if
+             e = jnext(e)
+          end do
+       end if
+       call sleep_ms(50)
+    end do
+  end subroutine cdp_new_window
 
   subroutine cdp_close_tab(port, id)
     integer, intent(in) :: port

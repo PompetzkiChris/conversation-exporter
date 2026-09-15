@@ -255,7 +255,8 @@
   (if (> (length all) 20) (take all 20) all))
 
 ;; "team.An": the API glues consecutive reply messages without a space
-(define (split-glue ws) (py-split (regexp-replace* #px"([.!?])(?=[A-Z])" (string-join ws " ") "\\1 ")))
+;; "boy.”That": closing quotes or brackets may sit between the stop and the next capital
+(define (split-glue ws) (py-split (regexp-replace* #px"([.!?][\"\u201D\u2019)\\]]*)(?=[A-Z])" (string-join ws " ") "\\1 ")))
 
 (define (check-assistant-text! rep t cap)
   (define arts (arts-of cap))
@@ -321,7 +322,9 @@
       (define names-ok
         (and (= (length exp-names) (length act-names))
              (for/and ([e exp-names] [d act-names]) (or (eq? d 'null) (equal? d e)))))
-      (define ok (and names-ok (equal? exp-ids dom-ids) (equal? exp-prev act-prev) size-ok))
+      ;; a file without a preview (a PDF) has no element on the page that carries its id
+      (define visible-ids (for/list ([x api]) (if (truthy? (jget x 'previewUrl)) (jget x 'fileId) 'null)))
+      (define ok (and names-ok (equal? visible-ids dom-ids) (equal? exp-prev act-prev) size-ok))
       ;; names live only in a hover tooltip; a null DOM name means the tooltip did not render (hidden tab)
       ;; and is not an error and not a warning (SPEC 0.5): the identity is the fileId / preview URL.
       ;; The record says where the names came from (nameSource), as the reference verifier does.
@@ -330,7 +333,7 @@
                 'nameSource (if (for/and ([d act-names]) (not (eq? d 'null)))
                                 "dom tooltip"
                                 "api (the page shows the name only in a hover tooltip)")
-                'rule "fileIds and previewUrls equal; DOM names equal when present; sizes equal when files are given"))))
+                'rule "fileIds equal where the API has a preview (the page shows the id only in the preview image URL); previewUrls equal; DOM names equal when present; sizes equal when files are given"))))
 
 (define (check-thought-label! rep t cap)
   (define arts (arts-of cap))
@@ -343,11 +346,20 @@
     (define delta (if (or (eq? secs 'null) (eq? dur 'null) (not (exact-integer? dur)))
                       'null
                       (abs (- (* secs 1000) dur))))
-    (define ok (and (not (eq? delta 'null)) (<= delta 2000)))
-    (rep-add! rep "thought-label" i
-              (hasheq 'durationMs dur 'toleranceMs 2000)
-              (hasheq 'label label 'seconds secs 'deltaMs delta)
-              ok)))
+    ;; the page shows no Thoughts label for a reply whose thinking produced no events
+    (define no-events? (and (not (truthy? label))
+                            (not (for/or ([rl (in-list (or-empty-list (jget th 'rollouts)))]) (truthy? (jget rl 'events))))))
+    (define ok (or no-events? (and (not (eq? delta 'null)) (<= delta 2000))))
+    (if no-events?
+        (rep-add! rep "thought-label" i
+                  (hasheq 'durationMs dur 'toleranceMs 2000)
+                  (hasheq 'label label 'seconds secs 'deltaMs delta)
+                  ok
+                  'note "no thinking events in the API and no Thoughts label on the page")
+        (rep-add! rep "thought-label" i
+                  (hasheq 'durationMs dur 'toleranceMs 2000)
+                  (hasheq 'label label 'seconds secs 'deltaMs delta)
+                  ok))))
 
 (define (sorted-unique-strings l)
   (sort (remove-duplicates l) string<?))
@@ -467,6 +479,8 @@
     (define i (jget turn 'index))
     (define pan (panel cap 'sourcesByArticle i))
     (define exp-rows
+      (filter
+       (lambda (r) (not (and (equal? (hash-ref r 'apiKind) "browsePage") (string-prefix? (hash-ref r 'key) "grok.com/"))))   ; grok.com's own pages are not sources
       (for/list ([p (in-list (api-events turn))]
                  #:when (and (equal? (jget (cdr p) 'type) "tool")
                              (string? (jget (cdr p) 'kind))
@@ -479,7 +493,7 @@
         (define key (if (equal? kind "browsePage") (urlkey (jget args 'url)) (norm (jget args 'query))))
         (hasheq 'rollout (jget (car p) 'id) 'kind (hash-ref DOM-KIND kind) 'apiKind kind 'key key
                 'count (if (equal? kind "webSearch") (length items) 'null)
-                'urls (if (equal? kind "webSearch") (for/list ([x items]) (jget x 'url)) 'null))))
+                'urls (if (equal? kind "webSearch") (for/list ([x items]) (jget x 'url)) 'null)))))
     (unless (and (null? exp-rows) (not (truthy? pan)))
       (define ids (remove-duplicates
                    (for/list ([rl (in-list (or-empty-list (jget (or-empty-hash (jget turn 'thinking)) 'rollouts)))]
@@ -537,6 +551,9 @@
                 'extraInDom (map key-rec extra)
                 'urlMismatches url-mismatch))))
 
+;; grok.com appends ?referrer=grok-com to X post links it renders
+(define (href-key h) (if (string? h) (regexp-replace #px"[?&]referrer=grok-com$" h "") h))
+
 (define (check-citations! rep t cap)
   (define arts (arts-of cap))
   (for ([turn (in-list (turns-of t))] #:when (assistant? turn))
@@ -557,8 +574,8 @@
       (cond
         [have-urls
          (define count-ok (or (= eff (length distinct)) (= eff (length cits))))
-         (define bad-href (for/list ([h hrefs] #:unless (member h api-urls)) h))
-         (define unverifiable (for/list ([u distinct] #:unless (member u hrefs)) u))
+         (define bad-href (for/list ([h hrefs] #:unless (member (href-key h) api-urls)) h))
+         (define unverifiable (for/list ([u distinct] #:unless (member u (map href-key hrefs))) u))
          (define groups-without-href (for/list ([c chips] #:unless (truthy? (jget c 'href))) c))
          (define ok (and count-ok (null? bad-href) (or (null? unverifiable) (pair? groups-without-href))))
          (rep-add! rep "citations" i exp act ok
@@ -579,6 +596,22 @@
                    #:when (exact-integer? (string->number (symbol->string k))))
           (string->number (symbol->string k)))
         <))
+
+;; Searched images: the page's image figures link to the same pages as the API's image cards, in order.
+(define (check-images! rep t cap)
+  (define arts (arts-of cap))
+  (for ([turn (in-list (turns-of t))] #:when (assistant? turn))
+    (define i (jget turn 'index))
+    (define api (or-empty-list (jget turn 'images)))
+    (define dom (or-empty-list (jget (art-at arts i) 'images)))
+    (unless (and (null? api) (null? dom))
+      (define exp-links (for/list ([x api]) (jget x 'link)))
+      (define act-links (for/list ([d dom]) (jget d 'link)))
+      (rep-add! rep "images" i
+                (hasheq 'count (length api) 'links exp-links)
+                (hasheq 'count (length dom) 'links act-links 'srcs (for/list ([d dom]) (jget d 'src)))
+                (equal? exp-links act-links)
+                'rule "page image links equal the API image cards' links, in order"))))
 
 (define (check-expansion! rep t cap)
   (for ([pair (in-list (list (cons 'thoughtsByArticle "thoughts") (cons 'sourcesByArticle "sources")))])
@@ -616,6 +649,7 @@
   (check-chatroom! rep t cap)
   (check-tool-rows! rep t cap)
   (check-citations! rep t cap)
+  (check-images! rep t cap)
   (check-expansion! rep t cap)
   (check-api-presence! rep t cap)
   (values (reverse (report-checks rep)) (reverse (report-warnings rep))))
@@ -663,7 +697,12 @@
     (unless (memq k '(capturedAt env)) (hash-set! out k v)))
   (hash-set! out 'articles
              (for/list ([a (in-list (or-empty-list (jget cap 'articles)))])
-               (for/hasheq ([(k v) (in-hash (or-empty-hash a))] #:unless (eq? k 'html)) (values k v))))
+               (for/hasheq ([(k v) (in-hash (or-empty-hash a))] #:unless (eq? k 'html))
+                 ;; attachment names come from a hover tooltip that one read may render and the other not
+                 (values k (if (and (eq? k 'attachments) (list? v))
+                               (for/list ([x (in-list v)])
+                                 (if (hash? x) (for/hasheq ([(kk vv) (in-hash x)] #:unless (eq? kk 'name)) (values kk vv)) x))
+                               v)))))
   out)
 
 (define (jtype v)
@@ -710,19 +749,60 @@
   (hash-set! rec 'expected (hasheq 'sha256 (sha-str s1) 'bytes (bytes-length (string->bytes/utf-8 s1)) 'file name1))
   (hash-set! rec 'actual (hasheq 'sha256 (sha-str s2) 'bytes (bytes-length (string->bytes/utf-8 s2)) 'file name2))
   (hash-set! rec 'ok ok)
-  (hash-set! rec 'ignored '("capturedAt" "env" "articles[*].html"))
+  (hash-set! rec 'ignored '("capturedAt" "env" "articles[*].html" "articles[*].attachments[*].name"))
   (hash-set! rec 'differences (if ok '() (diff-paths (strip-env cap1) (strip-env cap2))))
   rec)
 
 ;; ------------------------------------------------------------------ api-consistency (check 13)
 (define CIT-PATH-RX #px"^/turns/[0-9]+/citations/[0-9]+/(url|kind)$")
+(define API-CONSISTENCY-RULE
+  (string-append "transcripts built from the chunk and the legacy payload differ only in citations[].url/kind "
+                 "(X post results without an author, which one format lists and the other omits, are left out)"))
+
+;; A post the API lists by id but never hydrates (deleted, unavailable) comes back as an X result with no
+;; username in the chunk format and not at all in the legacy one.  -> copy of t without those items, each
+;; turn's sources.toolResultRows lowered by the number dropped.
+(define (drop-authorless-x t)
+  (define (hset h k v) (hash-set (for/hasheq ([(a b) (in-hash h)]) (values a b)) k v))
+  (define (fix-turn turn)
+    (define removed 0)
+    (define th (jget turn 'thinking))
+    (cond
+      [(not (hash? th)) turn]
+      [else
+       (define rollouts*
+         (for/list ([rl (in-list (or-empty-list (jget th 'rollouts)))])
+           (if (not (hash? rl))
+               rl
+               (hset rl 'events
+                     (for/list ([ev (in-list (or-empty-list (jget rl 'events)))])
+                       (define res (jget ev 'results))
+                       (cond
+                         [(and (hash? res) (equal? (jget res 'kind) "x"))
+                          (define items (or-empty-list (jget res 'items)))
+                          (define kept (filter (lambda (it) (truthy? (jget it 'username))) items))
+                          (set! removed (+ removed (- (length items) (length kept))))
+                          (hset ev 'results (hset res 'items kept))]
+                         [else ev]))))))
+       (cond
+         [(zero? removed) turn]
+         [else
+          (define src (jget turn 'sources))
+          (define turn1 (hset turn 'thinking (hset th 'rollouts rollouts*)))
+          (if (and (hash? src) (exact-integer? (jget src 'toolResultRows)))
+              (hset turn1 'sources (hset src 'toolResultRows (- (jget src 'toolResultRows) removed)))
+              turn1)])]))
+  (for/fold ([t* t]) ([key (in-list '(turns offBranchTurns))])
+    (if (and (hash? t*) (list? (jget t* key)))
+        (hset t* key (map fix-turn (jget t* key)))
+        t*)))
 
 ;; t-chunk / t-legacy: transcript jsexprs built from the two share payloads.
 (define (api-consistency-check t-chunk t-legacy #:chunk-name [n1 "chunk"] #:legacy-name [n2 "legacy"])
   (define rec (make-hasheq))
   (hash-set! rec 'name "api-consistency")
   (hash-set! rec 'turnIndex 'null)
-  (hash-set! rec 'rule "transcripts built from the chunk and the legacy payload differ only in citations[].url/kind")
+  (hash-set! rec 'rule API-CONSISTENCY-RULE)
   (cond
     [(or (not (hash? t-chunk)) (not (hash? t-legacy)))
      (hash-set! rec 'expected (hasheq 'format n1 'available (hash? t-chunk)))
@@ -733,7 +813,7 @@
     [else
      (define s1 (jsexpr->canonical-string t-chunk))
      (define s2 (jsexpr->canonical-string t-legacy))
-     (define diffs (diff-paths t-chunk t-legacy "" 100000))
+     (define diffs (diff-paths (drop-authorless-x t-chunk) (drop-authorless-x t-legacy) "" 100000))
      (define permitted (filter (lambda (d) (regexp-match? CIT-PATH-RX (hash-ref d 'path))) diffs))
      (define others (filter (lambda (d) (not (regexp-match? CIT-PATH-RX (hash-ref d 'path)))) diffs))
      (hash-set! rec 'expected (hasheq 'format n1 'sha256 (sha-str s1) 'bytes (bytes-length (string->bytes/utf-8 s1))))

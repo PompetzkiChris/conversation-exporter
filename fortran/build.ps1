@@ -64,6 +64,7 @@ Link 'verify_offline.f90' 'verify_offline.exe'
 Link 'md_offline.f90' 'md_offline.exe'
 Link 'html_offline.f90' 'html_offline.exe'
 Link 'behavior_offline.f90' 'behavior_offline.exe'
+Link 'ws_merge_offline.f90' 'ws_merge_offline.exe'
 Link 'crypto_test.f90' 'crypto_test.exe'
 Link 'fx_main.f90' 'exporter-f.exe'
 # the window: no console, Win32 only (it runs exporter-f.exe for the export itself)

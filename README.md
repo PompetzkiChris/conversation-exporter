@@ -11,7 +11,7 @@ writes it to a folder.
 
 | File | Contents |
 |---|---|
-| `transcript.json` | Every turn: your messages and attachments, the reply, model, timestamps. Grok: every agent's thoughts, every tool call (web / X / page / code), every search result, citations resolved to URLs, sources. Gemini and Qwen: thinking, web results, regenerated branches, blocked replies. |
+| `transcript.json` | Every turn: your messages and attachments, the reply, model, timestamps. Grok: every agent's thoughts, every tool call (web / X / page / code) with its command output and exit code, every search result, citations resolved to URLs, sources. Edited messages and regenerated replies: the branch the page shows, plus every other version under `offBranchTurns`. Gemini and Qwen: thinking, web results, regenerated branches, blocked replies. |
 | `transcript.md` | The same, readable. |
 | `transcript.html` | The same as a self-contained page, attachments embedded. |
 | `verification.json` | Check-by-check comparison of the saved text with the rendered page (turn count, user text, reply text, attachments, thought timers, agents, summaries, tool rows, citations, panel expansion, stability across two independent page reads, and consistency between Grok's two API formats). |
@@ -81,6 +81,14 @@ Exports go to `Documents\Exporter\exports` unless `--out` says otherwise.
 * The exporter only reads. It never sends messages, edits, deletes or shares anything.
 * Grok sometimes serves a conversation with its X posts stripped for a while after a page load; the
   exporter detects this, re-fetches, and records every rejected attempt under `raw/`.
+* Grok's REST API returns code-execution calls without their output. The exporter records the
+  conversation history the page receives over its WebSocket (`raw/ws-history.json`) and fills each
+  command's stdout and exit code from it.
+* Attachment downloads retry on network errors, 429 and 5xx. If Google answers with its
+  rate-limit page (`google.com/sorry`) the Gemini export stops at once and says so; wait a while
+  and run it again. The exporter never tries to get past that page.
+* Long Grok conversations open with only their latest turns; the exporter loads the rest before reading the page.
+  Searched images in a reply are kept as `images` (title, source page, image URL) instead of raw markup.
 * A Qwen desktop app started with `--remote-debugging-port=9223` can be read as a fallback; that
   window is never navigated, scrolled or screenshotted.
 

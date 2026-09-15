@@ -45,7 +45,10 @@
   const RESULT_SEL = '[class~="group/search-result"]';
   const BOX_SEL = 'div[style*="height"]';
   const q = (root, sel) => Array.from((root || document).querySelectorAll(sel));
-  const aside = () => document.querySelector('aside');
+  // the Thoughts / Sources panel; a build conversation also keeps its app preview pane (Preview, Files, Publish) in an
+  // <aside>, which is not a panel and has no Close button
+  const aside = () => Array.from(document.querySelectorAll('aside'))
+    .find((a) => !a.querySelector('button[aria-label="Reload app preview"], button[aria-label="Mobile preview"]')) || null;
   const styleOf = (el) => (el.getAttribute('style') || '');
   const isH0 = (el) => /height:\s*0px/.test(styleOf(el));
   const hasContent = (el) => !!(el && el.firstElementChild && norm(el.textContent));
@@ -181,6 +184,19 @@
     let arts = q(document, '[role=article]');
     if (!arts.length) return 0;
     const sc = scrollableOf(arts[0]);
+    // A long conversation opens with only its latest turns (about 50); Grok prepends the next older batch each
+    // time the transcript sits at the top.  Hold it there until the count stops growing and nothing is loading.
+    const tOlder = Date.now();
+    let before = arts.length, quiet = 0;
+    while (quiet < 3 && Date.now() - tOlder < 300000) {
+      sc.scrollTop = 0;
+      sc.dispatchEvent(new WheelEvent('wheel', { deltaY: -2000, bubbles: true }));
+      await sleep(500);
+      const n = q(document, '[role=article]').length;
+      const loading = q(sc, '[role=progressbar], .animate-spin').length > 0;
+      if (n > before) { say('older turns loaded: ' + before + ' -> ' + n); before = n; quiet = 0; }
+      else if (!loading) quiet++;
+    }
     sc.scrollTop = 0; await sleep(200);
     let last = -1, stable = 0, lastTop = -1, stuck = 0;
     for (let guard = 0; guard < 400; guard++) {
@@ -196,6 +212,15 @@
     sc.scrollTop = 0; await sleep(150);
     return q(document, '[role=article]').length;
   }
+  // Panel innerText without the "Show more" / "Show less" clamp buttons: whether a block is clamped depends on
+  // layout timing, so the label differs between two reads of the same panel while the content does not.
+  function panelText(root) {
+    const hid = q(root, 'button').filter((b) => /^Show (more|less)$/.test(norm(b.innerText))).map((b) => [b, b.style.display]);
+    hid.forEach(([b]) => { b.style.display = 'none'; });
+    const t = (root.innerText || '').replace(/\r/g, '');
+    hid.forEach(([b, d]) => { b.style.display = d; if (!d) b.removeAttribute('style'); });
+    return t;
+  }
   // innerText with every rendered KaTeX formula read as its TeX source (the <annotation> KaTeX keeps), so the
   // page text lines up with the API text, which carries the TeX.  The swap is synchronous and fully undone.
   function textWithTex(root) {
@@ -209,8 +234,9 @@
       shown.push([k, s, k.style.display]);
       k.style.display = 'none';
     }
-    // code blocks carry a header (language label, Collapse / Copy buttons) that is page chrome, not message text
-    const chrome = q(root, '[class~="group/code-header"]').map((h) => [h, h.style.display]);
+    // code blocks carry a header (language label, Collapse / Copy buttons) that is page chrome, not message text;
+    // a searched image renders as a figure (source domain link, caption) where the API text has an image card
+    const chrome = q(root, '[class~="group/code-header"], [data-testid="image-viewer"]').map((h) => [h, h.style.display]);
     chrome.forEach(([h]) => { h.style.display = 'none'; });
     const t = (root.innerText || '').replace(/\r/g, '');
     chrome.forEach(([h, d]) => { h.style.display = d; if (!d) h.removeAttribute('style'); });
@@ -338,9 +364,10 @@
   }
   const isAccordion = (a) => !!a.querySelector('h3 > button[aria-controls]') && !a.querySelector(SROW_SEL);
 
+  let articleEls = [];   // the elements collectArticles read; the page may mount more turns afterwards
   async function collectArticles() {
     const out = [];
-    const arts = q(document, '[role=article]');
+    const arts = articleEls = q(document, '[role=article]');
     for (let i = 0; i < arts.length; i++) {
       const a = arts[i];
       const label = a.getAttribute('aria-label') || '';
@@ -359,6 +386,11 @@
       }
       const tb = a.querySelector('button[class~="group/notes"]');
       const sb = q(a, '[role=button][aria-label]').find((b) => /\bsources?$/i.test(b.getAttribute('aria-label')));
+      // searched images shown in the reply (the API's image cards), in page order
+      const images = [].concat(...(canvas ? mds : (md ? [md] : [])).map((m) => q(m, '[data-testid="image-viewer"]'))).map((v) => {
+        const img = v.querySelector('img'), link = v.querySelector('a[href]');
+        return { src: img ? img.getAttribute('src') : null, alt: img ? img.getAttribute('alt') : null, link: link ? link.getAttribute('href') : null };
+      });
       out.push({
         index: i, role, ariaLabel: label,
         text: (canvas && mds.length > 1) ? mds.map((m) => textWithoutChips(m).trim()).join('') : (md ? textWithoutChips(md) : textWithTex(a)),
@@ -366,6 +398,7 @@
         citationChips: chips, attachments,
         thoughtLabel: tb ? norm(tb.innerText) : (canvas ? norm(canvas.innerText) : null),
         sourcesLabel: sb ? sb.getAttribute('aria-label') : null,
+        ...(images.length ? { images } : {}),
       });
     }
     return out;
@@ -514,6 +547,14 @@
       rows.push({ type: 'tool', kind: 'connector', query: first, count: null, url: null, results: [] });
       return rows;
     }
+    // image searches, X thread reads and image views are tool calls (imageSearch, xThreadFetch, viewImage), not summaries
+    const head1 = first || norm(col.innerText);
+    if (/^(Searched images|Reading thread|Viewed image)\b/.test(head1)) {
+      const t = parseToolHead(head);
+      const box = q(col, BOX_SEL).find((d) => d.querySelector('a[href]')) || null;
+      rows.push({ type: 'tool', kind: (head1.match(/^(Searched images|Reading thread|Viewed image)/) || [])[1], query: t.query, count: t.count, url: t.url, results: parseResults(box) });
+      return rows;
+    }
     if (first && TOOL_KINDS.includes(first)) {
       const t = parseToolHead(head);
       const box = q(col, BOX_SEL).find((d) => d.querySelector('a[href]')) || null;
@@ -583,7 +624,7 @@
   stats.userArticles = articles.filter((x) => x.role === 'user').length;
   stats.assistantArticles = articles.filter((x) => x.role === 'assistant').length;
   const thoughtsByArticle = {}, sourcesByArticle = {};
-  const arts = q(document, '[role=article]');
+  const arts = articleEls;
   for (let i = 0; i < arts.length; i++) {
     if (articles[i].role !== 'assistant') continue;
     if (only && only.article !== i) continue;
@@ -600,7 +641,7 @@
       const remainingCollapsed = canvasClosedToggles(box).length;
       const rows = sections.reduce((n, s) => n + s.rows.length, 0);
       const links = countLinks(box);
-      thoughtsByArticle[i] = { layout: 'canvas', sections, innerText: (box.innerText || '').replace(/\r/g, ''), remainingCollapsed, rowCount: rows, linkCount: links };
+      thoughtsByArticle[i] = { layout: 'canvas', sections, innerText: panelText(box), remainingCollapsed, rowCount: rows, linkCount: links };
       stats.thoughtsPanels++; stats.thoughtRows += rows; stats.thoughtLinks += links; stats.remainingCollapsedTotal += remainingCollapsed;
       say('canvas ' + i + ': rows ' + rows + ' links ' + links + ' remaining ' + remainingCollapsed);
     } else if (!only || only.panel === 'thoughts') {
@@ -620,7 +661,7 @@
           say('thoughts ' + i + ': remaining computed');
           const rows = sections.reduce((n, s) => n + s.rows.length, 0);
           const links = countLinks(a);
-          thoughtsByArticle[i] = { sections, innerText: (a.innerText || '').replace(/\r/g, ''), remainingCollapsed, rowCount: rows, linkCount: links };
+          thoughtsByArticle[i] = { sections, innerText: panelText(a), remainingCollapsed, rowCount: rows, linkCount: links };
           stats.thoughtsPanels++; stats.thoughtRows += rows; stats.thoughtLinks += links; stats.remainingCollapsedTotal += remainingCollapsed;
           say('thoughts ' + i + ': sections ' + sections.length + ' rows ' + rows + ' links ' + links + ' remaining ' + remainingCollapsed);
         }
@@ -648,7 +689,7 @@
           const remainingCollapsed = remainingCollapsedSources(a);
           const rows = sections.reduce((n, s) => n + s.rows.length, 0);
           const links = countLinks(a);
-          sourcesByArticle[i] = { label: sb.getAttribute('aria-label'), sections, innerText: (a.innerText || '').replace(/\r/g, ''), remainingCollapsed, rowCount: rows, linkCount: links };
+          sourcesByArticle[i] = { label: sb.getAttribute('aria-label'), sections, innerText: panelText(a), remainingCollapsed, rowCount: rows, linkCount: links };
           stats.sourcesPanels++; stats.sourceRows += rows; stats.sourceLinks += links; stats.remainingCollapsedTotal += remainingCollapsed;
           say('sources ' + i + ': sections ' + sections.length + ' rows ' + rows + ' links ' + links + ' remaining ' + remainingCollapsed);
         }

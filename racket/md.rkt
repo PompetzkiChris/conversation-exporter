@@ -208,7 +208,13 @@
     [(equal? k "bash")
      (head (one-line (arg-str a 'description)))
      (define cmd (arg-str a 'command))
-     (when (non-empty? cmd) (emit-fenced! L "bash" cmd))]
+     (when (non-empty? cmd) (emit-fenced! L "bash" cmd))
+     ;; command output (WebSocket history, see transcript.rkt merge-ws-tool-results!)
+     (when (and (equal? (jget res 'kind) "code") (string? (jget res 'stdout)))
+       (L (if (exact-integer? (jget res 'exitCode))
+              (format "  Output (exit code ~a):" (jget res 'exitCode))
+              "  Output:"))
+       (emit-fenced! L "text" (jget res 'stdout)))]
     [(equal? k "editFile")
      (define fp (arg-str a 'filePath 'file_path))
      (define olds (arg-str a 'oldString 'old_string))
@@ -241,6 +247,10 @@
      (when (non-empty? aj) (emit-fenced! L "json" (pretty-json-string aj)))
      (emit-results! L res)]))
 
+(define OTHER-VERSIONS-HEADING "## Other versions")
+(define OTHER-VERSIONS-NOTE
+  "Edited messages and regenerated replies that are not on the current branch of the conversation (the branch the page shows). transcript.json keeps them under offBranchTurns with their responseId and parentResponseId.")
+
 (define (transcript->markdown t)
   (define out (open-output-string))
   (define (L s) (write-string s out) (write-char #\newline out))
@@ -252,10 +262,19 @@
   (L (string-append "- Created: " (py-str (jget c 'createTime))))
   (L (string-append "- Modified: " (py-str (jget c 'modifyTime))))
   (L "")
-  (for ([turn (in-list (or-empty-list (jget t 'turns)))])
+  ;; offBranchTurns (edited messages, regenerated replies) follow the current branch under their own heading
+  (define main-turns (or-empty-list (jget t 'turns)))
+  (define n-main (length main-turns))
+  (for ([turn (in-list (append main-turns (or-empty-list (jget t 'offBranchTurns))))] [pos (in-naturals)])
+    (define tl (if (>= pos n-main) "other version" "turn"))
+    (when (= pos n-main)
+      (L OTHER-VERSIONS-HEADING)
+      (L "")
+      (L OTHER-VERSIONS-NOTE)
+      (L ""))
     (cond
       [(equal? (jget turn 'sender) "human")
-       (L (format "## User  (turn ~a, ~a)" (py-str (jget turn 'index)) (py-str (jget turn 'createTime))))
+       (L (format "## User  (~a ~a, ~a)" tl (py-str (jget turn 'index)) (py-str (jget turn 'createTime))))
        (L "")
        (emit-image-surfaces! L turn)
        (define atts (or-empty-list (jget turn 'attachments)))
@@ -268,7 +287,7 @@
        (L "")]
       [else
        (define th (or-empty-hash (jget turn 'thinking)))
-       (L (format "## Grok  (turn ~a, ~a, model ~a)"
+       (L (format "## Grok  (~a ~a, ~a, model ~a)" tl
                   (py-str (jget turn 'index)) (py-str (jget turn 'createTime)) (py-str (jget turn 'model))))
        (L "")
        (emit-image-surfaces! L turn)
@@ -330,6 +349,14 @@
            (L (format "- [~a] ~a (citationId ~a, card ~a)" n
                       (if (truthy? u) (py-str u) "unresolved")
                       (py-str (jget ci 'citationId)) (py-str (jget ci 'cardId)))))
+         (L ""))
+       (define imgs (or-empty-list (jget turn 'images)))
+       (when (pair? imgs)
+         (L "Images:")
+         (L "")
+         (for ([im (in-list imgs)] [n (in-naturals 1)])
+           (L (format "- [~a] ~a (~a) ~a  page ~a  (offset ~a)" n (one-line (py-str (jget im 'title)))
+                      (py-str (jget im 'source)) (py-str (jget im 'url)) (py-str (jget im 'link)) (py-str (jget im 'offset)))))
          (L ""))
        (define s (or-empty-hash (jget turn 'sources)))
        (define webs (or-empty-list (jget s 'webSearchResults)))
